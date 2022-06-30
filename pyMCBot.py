@@ -1,5 +1,5 @@
 
-import os, sys, math, socket, threading, time, struct, hashlib, zlib
+import os, sys, math, socket, threading, time, struct, hashlib, zlib, base64
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
@@ -68,6 +68,7 @@ class Client:
 		self._is_connected = False
 		self._is_logged_in = False
 		self._is_waiting_to_spawn = False
+		self._encryption_enabled = False
 		self.in_godmode = False
 		self.can_fly = False
 		self.is_flying = False
@@ -142,7 +143,6 @@ class Client:
 		self._is_waiting_to_spawn = True
 		if run:
 			self.run()
-		return True
 
 
 	def run(self):
@@ -154,7 +154,7 @@ class Client:
 		""" Pause until the bot is disconnected or a keyboard interrupt is triggered. """
 		try:
 			while self._is_connected:
-				time.sleep(0.1)
+				time.sleep(0.01)
 		except KeyboardInterrupt:
 			self._disconnect()
 
@@ -231,6 +231,7 @@ class Client:
 				self._debuglog("Sending Client Settings...")
 				self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 0, 9, 0, 0)
 				self._debuglog("Sent.")
+				# self._encryption_enabled = True
 			elif packetid == PacketID.DISCONNECT:
 				reason = self._receive_string()
 				try:
@@ -238,6 +239,9 @@ class Client:
 				except UnicodeEncodeError as e:
 					self._debuglog(f"Disconnected. Reason: {self._bytes_to_str(reason)}")
 				self._disconnect()
+			elif packetid == PacketID.CHATMESSAGE:
+				message = self._receive_string()
+				self._messagelog(message)
 			elif packetid == PacketID.TIMEUPDATE:      # S->C when the world age/time updates
 				self.worldage = self._receive_int(SIZEOF_LONG)
 				self.timeofday = self._receive_int(SIZEOF_LONG)
@@ -734,13 +738,29 @@ class Client:
 				self._decrypt_cipher = AES.new(sharedsecret, AES.MODE_CFB, sharedsecret)
 				self._encrypt_cipher = AES.new(sharedsecret, AES.MODE_CFB, sharedsecret)
 
-				if not self._is_logged_in:
-					self._debuglog("Sending Client Statuses...")
-					self._send_packet(PacketID.CLIENTSTATUSES, 0x00) # tell the server we're ready to spawn
-					self._debuglog("Sent.")
-					# print("Sending Client Settings...")
-					# self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 3, 9, 3, 1)
-					# print("Sent.")
+				self._encryption_enabled = True
+
+				self._debuglog("Sending Client Statuses...")
+				self._send_packet(PacketID.CLIENTSTATUSES, 0x00) # tell the server we're ready to spawn
+				self._debuglog("Sent.")
+
+				self._debuglog("Sending Client Settings...")
+				self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 3, 9, 3, 1)
+				self._debuglog("Sent.")
+
+				self._encryption_enabled = False
+
+			elif packetid == PacketID.ENCRYPTIONKEYRESPONSE:
+				sharedsecretlen = self._receive_int(SIZEOF_SHORT)
+				if sharedsecretlen > 0:
+					sharedsecret = self._receive(sharedsecretlen)
+					self._debuglog("Got shared secret:", sharedsecret)
+				verifytokenlen = self._receive_int(SIZEOF_SHORT)
+				if verifytokenlen > 0:
+					verifytoken = self._receive(verifytokenlen)
+					self._debuglog("Got verify token:", verifytoken)
+
+				self._encryption_enabled = True
 
 	def _update_block(self, cx, cz, x, y, z, blockid, metadata):
 		if x in range(16) and y in range(16):
@@ -787,7 +807,11 @@ class Client:
 		self._is_connected = True
 
 	def _disconnect(self):
-		self._send_packet(PacketID.DISCONNECT, 0, 0)
+		try:
+			self._send_packet(PacketID.DISCONNECT, 0, 0)
+		except:
+			pass
+
 		self._is_logged_in = False
 		self._is_connected = False
 
@@ -809,6 +833,9 @@ class Client:
 	def _debuglog(self, *args):
 		if self._debug_mode:
 			self.__logwrite("[D]", " ".join([str(arg) for arg in args]))
+
+	def _messagelog(self, *args):
+		self.__logwrite("[M]", " ".join([str(arg) for arg in args]))
 
 	def __logwrite(self, *args):
 		s = " ".join([arg for arg in args])
@@ -1042,12 +1069,12 @@ class Client:
 			self._warning(f"[_encode_double] Failed to encode float {data}")
 
 	def _encipher(self, data):
-		if self._encrypt_cipher is not None:
+		if self._encryption_enabled:
 			return self._encrypt_cipher.encrypt(data)
 		return data
 
 	def _decipher(self, data):
-		if self._decrypt_cipher is not None:
+		if self._encryption_enabled:
 			return self._decrypt_cipher.decrypt(data)
 		return data
 
@@ -1086,6 +1113,6 @@ if __name__=='__main__':
 	else:
 		client = Client(debug=debug)
 		client.connect(address, port)
-		if client.login(username, passwd):
-			client.dummy()
+		client.login(username, passwd)
+		client.dummy()
 
