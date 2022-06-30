@@ -1,0 +1,3 @@
+[submodule "smpmap"]
+	path = smpmap
+	url = https://github.com/barneygale/smpmap.git

@@ -1,9 +1,11 @@
 
-import os, sys, math, socket, threading, time, struct, hashlib
-from PacketID import PacketID
-from NBT import NBT
+import os, sys, math, socket, threading, time, struct, hashlib, zlib
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
+
+from PacketID import PacketID
+from NBT import NBT
+from smpmap.smpmap import *
 
 MC_DEFAULT_PORT = 25565
 PROTOCOL_VERSION = 78
@@ -60,65 +62,102 @@ ENTITY_METADATA_VALUE_TYPE_READERS = {
 
 class Client:
 	def __init__(self, debug=False):
-		self._sock = socket.socket()
-		self._sock.setblocking(True)
+		self._debug_mode = debug
+		self._packet_log_mode = False
 		self._packet_thread = None
 		self._is_connected = False
 		self._is_logged_in = False
+		self._is_waiting_to_spawn = False
 		self.in_godmode = False
 		self.can_fly = False
 		self.is_flying = False
 		self.in_creative_mode = False
-		self._debug_mode = debug
+		self.can_move = False
+		self.can_run = False
 		self._entities = {}
 		self.worldage = None
 		self.timeofday = None
 		self._update = None
 		self.last_packet_id = None
-		self.set_locale()
 		self.position = {"x": None, "y": None, "z": None}
+		self.stance_offset = 1.62
+		self.spawn_position = {"x": None, "y": None, "z": None}
 		self.rotation = {"pitch": None, "yaw": None}
+		self.health = None
+		self.food = None
+		self.saturation = None
 		self.equipment = {}
 		self.inventory = {}
 		self.tab_completed_string = None
 		self.__packet = None
 		self.__oldpackets = []
-		self.log_file = os.path.join(os.path.dirname(__file__), f"{time.strftime('%a_%b_%d_%Y.%I-%M-%S%p')}.log")
+
+		self._world = World()
+
+		self._sock = socket.socket()
+		self._sock.setblocking(True)
+		self._sock.settimeout(5)
+		self.set_locale()
+
+		self.log_file = os.path.join(os.path.dirname(__file__), "logs", f"{time.strftime('%a_%b_%d_%Y.%I-%M-%S%p')}.log")
+		if os.path.exists(os.path.dirname(self.log_file)):
+			if not os.path.isdir(os.path.dirname(self.log_file)):
+				print("Error: Could not open logs directory, a file exists with the same name.")
+				exit(1)
+		else:
+			os.mkdir(os.path.dirname(self.log_file))
 		self.log_fd = open(self.log_file, 'w')
 
 	def set_locale(self, locale="en_US"):
+		""" Set client language. """
 		self._locale = locale
 
-	def debug_mode(self, debug=True):
-		self.debug = debug
+	def set_debug_mode(self, debug=True):
+		""" Set whether debug logging is active. """
+		self._debug_mode = debug
+
+	def set_packet_log_mode(self, debug=True):
+		""" Set whether packet logging is active. """
+		self._packet_log_mode = debug
+
+	def is_handling_packets(self):
+		""" Returns True if the server's packet thread is alive. """
+		if self._packet_thread is not None:
+			return self._packet_thread.is_alive()
+		return False
+
+	def is_on_ground(self):
+		""" Returns True if the player is standing on a solid block. TODO: Implement. """
+		return True
 
 	def login(self, user, passwd=None, run=True):
-		""" Log into a server and run the bot (unless run=False)"""
+		""" Log into a server and run the bot. (unless run=False)"""
 		self._infolog("Logging in...")
 		self._send_packet(PacketID.HANDSHAKE, bytes([PROTOCOL_VERSION]),
 			self._encode_string(user), self._encode_string(self.host), self.port.to_bytes(4, 'big'))
 		self._debuglog("Sent handshake.")
 		self._infolog("Waiting for login...")
+		self._is_waiting_to_spawn = True
 		if run:
 			self.run()
 		return True
 
 
 	def run(self):
-		""" Start the bot's packet handling thread """
+		""" Start the bot's packet handling thread. """
 		self._packet_thread = threading.Thread(target=self._handle_packets)
 		self._packet_thread.start()
 
 	def dummy(self):
-		""" Pause until the bot is disconnected or a keyboard interrupt is triggered """
+		""" Pause until the bot is disconnected or a keyboard interrupt is triggered. """
 		try:
 			while self._is_connected:
-				time.sleep(0.5)
+				time.sleep(0.1)
 		except KeyboardInterrupt:
 			self._disconnect()
 
 	def console(self):
-		""" Run an interactive console until the bot is disconnected or a keyboard interrupt is triggered """
+		""" Run an interactive console until the bot is disconnected or a keyboard interrupt is triggered. """
 		try:
 			while self._is_connected:
 				cmd = input("> ")
@@ -127,34 +166,33 @@ class Client:
 				else:
 					cmd, args = cmd, []
 				if cmd in ("help", "h"):
-					print("stop       | stop the bot")
+					print("stop         (stop the bot)")
+					print("send packetid [f|d|i|s|b|\"|][value][\"] [...]")
 				elif cmd in ("stop",):
 					break
 		except KeyboardInterrupt:
 			pass
 		print("Shutting down...")
 		self._disconnect()
-		time.sleep(1) # wait
-
-	def is_handling_packets(self):
-		""" Returns true if the server's packet thread is alive """
-		if self._packet_thread is not None:
-			return self._packet_thread.is_alive()
-		return False
 
 	def _handle_packets(self):
 		while self._is_connected:
-			if self._update is not None:
-				self._update()
 			try:
-				self.handle_packet()
+				if self._update is not None:
+					self._update()
+				try:
+					self.handle_packet()
+				except TimeoutError:
+					pass
 			except KeyboardInterrupt:
 				break
-			except TimeoutError:
-				pass
+			except Exception as e:
+				self._errorlog(e)
+				# self._debuglog(list(self._world.columns.keys()))
+				break
 
 	def get_packet(self, i=None):
-		""" Return a previously processed packet or the current packet if no index is passed """
+		""" Return a previously processed packet or the current packet if no index is passed. Returns None if packet log mode is not enabled. """
 		if i is None:
 			return self.__packet
 		elif type(i) is int:
@@ -166,28 +204,30 @@ class Client:
 		if self._is_connected:
 			packetid = self._receive_int(SIZEOF_BYTE, signed=False)
 
-			if self.__packet is not None:
-				self.__oldpackets.append(bytes(self.__packet))
-			self.__packet = [packetid]
+			if self._packet_log_mode:
+				if self.__packet is not None:
+					self.__oldpackets.append(bytes(self.__packet))
+				self.__packet = [packetid]
 
 			self._debuglog(f"Got packet: {hex(packetid)}")
 			self.last_packet_id = packetid
 			if packetid == PacketID.KEEPALIVE:         # S<>C let the server know we're still listening
-				number = self._receive_int(SIZEOF_INT)
-				self._send_packet(PacketID.KEEPALIVE, number.to_bytes(SIZEOF_INT, 'big', signed=True))
+				number = self._receive(SIZEOF_INT)
+				self._debuglog(f"Keepalive Received.")
+				self._send_packet(PacketID.KEEPALIVE)
 			elif packetid == PacketID.LOGINREQUEST:    # S->C server response to handshake
 				self._eid = self._receive_int(SIZEOF_INT)
 				self._entities[self._eid] = {"equipment":self.equipment,"position":self.position,"rotation":self.rotation, "inventory":self.inventory}
-				self._leveltype = self._receive_string()
-				self._gamemode = self._receive_int(SIZEOF_BYTE)
-				self._dimension = self._receive_int(SIZEOF_BYTE)
-				self._difficulty = self._receive_int(SIZEOF_BYTE)
+				self.level_type = self._receive_string()
+				self.gamemode = self._receive_int(SIZEOF_BYTE)
+				self.dimension = self._receive_int(SIZEOF_BYTE)
+				self.difficulty = self._receive_int(SIZEOF_BYTE)
 				self._receive_int(SIZEOF_BYTE) # unused field
 				self._maxplayers = self._receive_int(SIZEOF_BYTE)
 				self._is_logged_in = True
 				self._infolog("Logged in.")
 				self._debuglog("Sending Client Settings...")
-				self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), bytes([3, 9, 0, 0]))
+				self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 0, 9, 0, 0)
 				self._debuglog("Sent.")
 			elif packetid == PacketID.DISCONNECT:
 				reason = self._receive_string()
@@ -212,25 +252,44 @@ class Client:
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_INT)
 				z = self._receive_int(SIZEOF_INT)
-				self._spawnpoint = {"x": x, "y": y, "z": z}
+				self.spawn_position = {"x": x, "y": y, "z": z}
 			elif packetid == PacketID.UPDATEHEALTH:    # S->C when player health/hunger/saturation changes
-				self._health = self._receive_float()
-				self._food = self._receive_int(SIZEOF_SHORT)
-				self._saturation = self._receive_float()
+				self.health = self._receive_float()
+				self.food = self._receive_int(SIZEOF_SHORT)
+				self.saturation = self._receive_float()
+				self.can_run = self.food > 6.0
+				if self.health <= 0.0:
+					self._send_packet(PacketID.CLIENTSTATUSES, 0x01) # tell the server we're ready to respawn
 			elif packetid == PacketID.RESPAWN:         # S->C when player respawns
-				self._dimension = self._receive_int(SIZEOF_INT)
-				self._difficulty = self._receive_int(SIZEOF_BYTE, signed=False)
-				self._gamemode = self._receive_int(SIZEOF_BYTE, signed=False)
-				self._worldheight = self._receive_int(SIZEOF_BYTE, signed=False)
-				self._leveltype = self._receive_string()
+				self._debuglog("Received respawn packet")
+				self.dimension = self._receive_int(SIZEOF_INT)
+				self.difficulty = self._receive_int(SIZEOF_BYTE, signed=False)
+				self.gamemode = self._receive_int(SIZEOF_BYTE, signed=False)
+				self.worldheight = self._receive_int(SIZEOF_BYTE, signed=False)
+				self.level_type = self._receive_string()
+				self._debuglog(f"Spawning in {self.dimension} level type {self.level_type} at",
+					f"({self.spawn_position['x']}, {self.spawn_position['y']}, {self.spawn_position['z']})",
+					f"with difficulty {self.difficulty}")
+				self.position = self.spawn_position
+				self._send_packet(PacketID.PLAYER, 1 if self.is_on_ground() else 0)
+				self._send_packet(PacketID.PLAYERPOS, self._encode_double(self.position['x']),
+					self._encode_double(self.position['y']), self._encode_double(self.position['y']+self.stance_offset),
+					self._encode_double(self.position['z']), 1 if self.is_on_ground() else 0)
 			elif packetid == PacketID.PLAYERPOSANDLOOK: # S<>C when the player moves
 				self.position["x"] = self._receive_double()
-				self._stance = self._receive_double()
+				self.stance_offset = self._receive_double()
 				self.position["y"] = self._receive_double()
+				self.stance_offset -= self.position["y"]
 				self.position["z"] = self._receive_double()
 				self.rotation["yaw"] = self._receive_float()
 				self.rotation["pitch"] = self._receive_float()
 				self._on_ground = self._receive_int() > 0
+				if self._is_waiting_to_spawn:
+					self._send_packet(PacketID.PLAYERPOSANDLOOK, self._encode_double(self.position['x']),
+						self._encode_double(self.position['y']), self._encode_double(self.position['y']+self.stance_offset),
+						self._encode_double(self.position['z']), self._encode_float(self.rotation['yaw']),
+						self._encode_float(self.rotation['pitch']), 1 if self.is_on_ground() else 0)
+					self._is_waiting_to_spawn = False
 			elif packetid == PacketID.HELDITEMCHANGE:   # S<>C when held item slot changes
 				self._hotbar_selection = self._receive_int(SIZEOF_SHORT)
 			elif packetid == PacketID.USEBED:           # S->C when an entity goes to sleep
@@ -373,7 +432,9 @@ class Client:
 			elif packetid == PacketID.ENTITYSTATUS:         # S->C Set the status of an entity
 				eid = self._receive_int(SIZEOF_INT)
 				status = self._receive_int(SIZEOF_BYTE)
-				if eid in self._entities.keys():
+				if eid == self._eid:
+					self._entity_status = status
+				elif eid in self._entities.keys():
 					self._entities[eid]["status"] = status
 			elif packetid == PacketID.ATTACHENTITY:         # S->C Attach an entity to another entity
 				eid = self._receive_int(SIZEOF_INT)
@@ -429,26 +490,44 @@ class Client:
 						self._debuglog(f"UUID: 0x{''.join([hex(c//16)[2]+hex(c%16)[2] for c in uuid])} (big-endian)")
 						self._debuglog(f"amount: {amount}")
 						self._debuglog(f"operation: {operation}")
-			elif packetid == PacketID.CHUNKDATA:         # S->C Sent chunk data
+			elif packetid == PacketID.CHUNKDATA:          # S->C When sending a single chunk's data
 				cx = self._receive_int(SIZEOF_INT)
 				cz = self._receive_int(SIZEOF_INT)
-				groundupcontinuous = self._receive_int(SIZEOF_BYTE)
-				primarybitmap = self._receive_int(SIZEOF_SHORT, signed=False)
-				addbitmap = self._receive_int(SIZEOF_SHORT, signed=False)
-				compresseddatalen = self._receive_int(SIZEOF_INT)
-				compresseddata = self._receive(compresseddatalen)
-			elif packetid == PacketID.MULTIBLOCKCHANGE:
+				continuous = self._receive_int(SIZEOF_BYTE)
+				mask1 = self._receive_int(SIZEOF_SHORT)
+				mask2 = self._receive_int(SIZEOF_SHORT)
+				compresseddatalen = self._receive(SIZEOF_INT)
+				compresseddata = self._receive(int.from_bytes(compresseddatalen, 'big', signed=True))
+				data = zlib.decompress(compresseddata)
+				key = (cx, cz)
+				if key in self._world.columns:
+					column = self._world.columns[key]
+				else:
+					column = ChunkColumn()
+					self._world.columns[key] = column
+				column.unpack(data, mask1, mask2, skylight=True) # Unpack the chunk column data
+				self._debuglog(f"Loaded chunk packet for chunk: ({cx}, {cz})")
+			elif packetid == PacketID.MULTIBLOCKCHANGE:   # S->C When multiple blocks update.
 				cx = self._receive_int(SIZEOF_INT)
 				cz = self._receive_int(SIZEOF_INT)
 				recordcount = self._receive_int(SIZEOF_SHORT)
 				datasize = self._receive_int(SIZEOF_INT)
-				records = self._receive(recordcount*4)
-			elif packetid == PacketID.BLOCKCHANGE:
+				key = (cx, cz)
+				for i in range(recordcount):
+					record = self._receive_int(4)
+					metadata = record & 0x0000000F
+					blockid = (record & 0x0000FFF0) // 0x00000010
+					y       = (record & 0x00FF0000) // 0x00010000
+					z       = (record & 0x0F000000) // 0x01000000
+					x       = (record & 0xF0000000) // 0x10000000
+					self._update_block(cx, cz, x, y, z, blockid, metadata)
+			elif packetid == PacketID.BLOCKCHANGE:        # S->C When a block updates.
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_BYTE, signed=False)
 				z = self._receive_int(SIZEOF_INT)
 				blocktype = self._receive_int(SIZEOF_SHORT)
-				blockmetadata = self._receive_int(SIZEOF_BYTE)
+				metadata = self._receive_int(SIZEOF_BYTE)
+				self._update_block(x//16, z//16, x&15, y, z&15, blocktype&0xFF, metadata)
 			elif packetid == PacketID.BLOCKACTION:
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_SHORT)
@@ -461,16 +540,15 @@ class Client:
 				y = self._receive_int(SIZEOF_SHORT)
 				z = self._receive_int(SIZEOF_INT)
 				destroystage = self._receive_int(SIZEOF_BYTE)
-			elif packetid == PacketID.MAPCHUNKBULK:
-				chunkcount = self._receive_int(SIZEOF_SHORT)
-				datalen = self._receive_int(SIZEOF_INT)
-				skylightsent = self._receive_int(SIZEOF_BYTE)
-				data = self._receive(datalen)
-				for i in range(chunkcount):
-					cx = self._receive_int(SIZEOF_INT)
-					cz = self._receive_int(SIZEOF_INT)
-					primarybitmap = self._receive_int(SIZEOF_SHORT)
-					addbitmap = self._receive_int(SIZEOF_SHORT)
+			elif packetid == PacketID.MAPCHUNKBULK:     # S->C When sending several chunks
+				chunkcount = self._receive(SIZEOF_SHORT)
+				datalen = self._receive(SIZEOF_INT)
+				skylightsent = self._receive(SIZEOF_BYTE)
+				data = list(self._receive(int.from_bytes(datalen, 'big', signed=True)))
+				for i in range(int.from_bytes(chunkcount, 'big', signed=True)):
+					data.extend(self._receive(SIZEOF_INT*2 + SIZEOF_SHORT*2))
+				self._world.unpack(chunkcount + datalen + skylightsent + bytes(data))
+				self._debuglog("Loaded bulk chunk packet.")
 			elif packetid == PacketID.EXPLOSION:
 				x = self._receive_double()
 				y = self._receive_double()
@@ -518,7 +596,7 @@ class Client:
 				elif reason == 2:
 					self._is_raining = False
 				elif reason == 3:
-					self._gamemode = gamemode
+					self.gamemode = gamemode
 			elif packetid == PacketID.SPAWNGLOBALENTITY:
 				entityid = self._receive_int(SIZEOF_INT)
 				entitytype = self._receive_int(SIZEOF_BYTE)
@@ -635,6 +713,7 @@ class Client:
 				channel = self._receive_string()
 				datalen = self._receive_int(SIZEOF_SHORT)
 				data = self._receive(datalen)
+				self._infolog("Plugin Message Received:", channel, self._bytes_to_str(data))
 			elif packetid == PacketID.ENCRYPTIONKEYREQUEST: # S->C Server sends serverid, pubkey, and verifytoken
 				self._serverid = self._receive_string()
 				self._serverpubkeylen = self._receive_int(SIZEOF_SHORT)
@@ -655,11 +734,28 @@ class Client:
 
 				if not self._is_logged_in:
 					self._debuglog("Sending Client Statuses...")
-					self._send_packet(PacketID.CLIENTSTATUSES, 0) # tell the server we're ready to spawn
+					self._send_packet(PacketID.CLIENTSTATUSES, 0x00) # tell the server we're ready to spawn
 					self._debuglog("Sent.")
 					# print("Sending Client Settings...")
 					# self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 3, 9, 3, 1)
 					# print("Sent.")
+
+	def _update_block(self, cx, cz, x, y, z, blockid, metadata):
+		if x in range(16) and y in range(16):
+			self._debuglog(f"[_update_block] updating block {x}, {y}, {z} in chunk {cx}, {cz} to {blockid}:{metadata}")
+			key = (cx, cz)
+			if key not in self._world.columns:
+				self._world.columns = ChunkColumn()
+			column = self._world.columns[key]
+			if column is None:
+				column = self._world.columns[key] = ChunkColumn()
+			chunk = column.chunks[y//16]
+			if chunk is None:
+				chunk = Chunk()
+			chunk['block_data'].put(x, y & 0xF, z, blockid)
+			chunk['block_meta'].put(x, y & 0xF, z, metadata)
+		else:
+			self._debuglog(f"[_update_block] failed: ({x}, {y}, {z}) is outside the allowed range. (16, 256, 16)")
 
 	def connect(self, addr=None, port=MC_DEFAULT_PORT):
 		if addr is None:
@@ -689,15 +785,14 @@ class Client:
 		self._is_connected = True
 
 	def _disconnect(self):
-		self._send_packet(PacketID.DISCONNECT)
-
+		self._send_packet(PacketID.DISCONNECT, 0, 0)
 		self._is_logged_in = False
+		self._is_connected = False
 
 		# wait for the packet handling thread to complete
 		while self.is_handling_packets():
 			time.sleep(0.05)
 
-		self._is_connected = False
 		self._sock.close()
 
 	def _errorlog(self, *args):
@@ -707,7 +802,7 @@ class Client:
 		self.__logwrite("[W]", " ".join([str(arg) for arg in args]))
 
 	def _infolog(self, *args):
-		self.__logwrite("[I]:", " ".join([str(arg) for arg in args]))
+		self.__logwrite("[I]", " ".join([str(arg) for arg in args]))
 
 	def _debuglog(self, *args):
 		if self._debug_mode:
@@ -723,7 +818,7 @@ class Client:
 		return self._receive(amt)
 
 	def _receive_metadata(self, data=None):
-		metadata = []
+		metadata = {}
 		while True:
 			item = self._receive_int(SIZEOF_BYTE, signed=False, data=data)
 			if item == 0x7F:
@@ -733,9 +828,9 @@ class Client:
 			if _type in ENTITY_METADATA_VALUE_TYPE_READERS.keys():
 				reader = ENTITY_METADATA_VALUE_TYPE_READERS[_type]
 				value = reader(self, data)
-				metadata.append({"key": key, "value": value, "type": _type})
+				metadata[key] = {"value": value, "type": _type}
 			else:
-				self._errorlog(f"Received invalid entity metadata key {key} type {_type}")
+				# self._errorlog(f"Received invalid entity metadata key {key} type {_type}")
 				raise ValueError(f"Invalid entity metadata received: key {key} type {_type} ({hex(item)})")
 
 	def _receive_slot(self, data=None):
@@ -802,11 +897,13 @@ class Client:
 				i += 1
 
 	def _receive_string(self, data=None):
-		num = self._receive_int(SIZEOF_SHORT, signed=False, data=data)
-		if data is None:
-			return self._bytes_to_str(self._receive(num * 2, data=data))
-		else:
-			return self._bytes_to_str(data[:num*2])
+		num = self._receive_int(SIZEOF_SHORT, signed=True, data=data)
+		if num > 0:
+			if data is None:
+				return self._bytes_to_str(self._receive(num * 2, data=data))
+			else:
+				return self._bytes_to_str(data[:num*2])
+		return ""
 
 	def _receive_objectdata(self, data=None):
 		intfield = self._receive_int(SIZEOF_INT, data=data)
@@ -843,8 +940,7 @@ class Client:
 					chunk = self._sock.recv(min(amt - bytes_recd, 2048))
 					if chunk == b'':
 						# self._errorlog("Socket Connection Broken")
-						# raise RuntimeError("socket connection broken")
-						return b''.join(chunks)
+						raise RuntimeError("Socket Connection Broken")
 					chunks.append(chunk)
 					bytes_recd = bytes_recd + len(chunk)
 				return b''.join(chunks)
@@ -854,17 +950,13 @@ class Client:
 					o.append(data.pop(0))
 				return bytes(o)
 		else:
-			return b''
-
+			# self._errorlog("Socket Connection Broken")
+			raise RuntimeError("Socket Connection Broken")
 	def _send(self, *args):
-		for data in args:
-			totalsent = 0
-			while totalsent < len(data):
-				sent = self._sock.send(data[totalsent:])
-				if sent == 0:
-					self._errorlog("Socket Connection Broken")
-					raise RuntimeError("socket connection broken")
-				totalsent = totalsent + sent
+		data = b''.join([data for data in args])
+		if self._sock.sendall(data) == 0:
+			self._errorlog("Socket Connection Broken")
+			raise RuntimeError("socket connection broken")
 
 	def _send_packet(self, packetid, *args):
 		o = [packetid]
@@ -875,7 +967,7 @@ class Client:
 				o.append(arg)
 			elif type(arg) is str:
 				o.extend(self._str_to_bytes(arg))
-		self._debuglog("Sending packet:", o)
+		self._debuglog("Sending packet:", bytes(o))
 		self._send(bytes(o))
 
 	def _encode_string(self, data):
@@ -929,6 +1021,21 @@ class Client:
 		except struct.error:
 			self._warning(f"[_decode_double] Failed to unpack double from data: 0x{''.join([hex(c//16)[2]+hex(c%16)[2] for c in data])} (big-endian)")
 
+	def _encode_float(self, data):
+		self._debuglog(f"[_encode_float] Packing float {data}")
+		try:
+			n = struct.pack('>f', data)
+			return n
+		except struct.error:
+			self._warning(f"[_encode_float] Failed to encode float {data}")
+
+	def _encode_double(self, data):
+		self._debuglog(f"[_encode_double] Packing float {data}")
+		try:
+			n = struct.pack('>f', data)
+			return n
+		except struct.error:
+			self._warning(f"[_encode_double] Failed to encode float {data}")
 
 if __name__=='__main__':
 	debug = False
@@ -965,5 +1072,5 @@ if __name__=='__main__':
 		client = Client(debug=debug)
 		client.connect(address, port)
 		if client.login(username, passwd):
-			client.console()
+			client.dummy()
 
