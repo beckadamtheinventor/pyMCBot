@@ -1,2 +1,3 @@
 [submodule "smpmap"]
 	url = https://github.com/beckadamtheinventor/smpmap.git
+	path = smpmap
