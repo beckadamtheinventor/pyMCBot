@@ -94,6 +94,8 @@ class Client:
 
 		self._world = World()
 
+		self._decrypt_cipher = None
+		self._encrypt_cipher = None
 		self._sock = socket.socket()
 		self._sock.setblocking(True)
 		self._sock.settimeout(5)
@@ -713,7 +715,7 @@ class Client:
 				channel = self._receive_string()
 				datalen = self._receive_int(SIZEOF_SHORT)
 				data = self._receive(datalen)
-				self._infolog("Plugin Message Received:", channel, self._bytes_to_str(data))
+				self._infolog("Plugin Message Received:", channel, data)
 			elif packetid == PacketID.ENCRYPTIONKEYREQUEST: # S->C Server sends serverid, pubkey, and verifytoken
 				self._serverid = self._receive_string()
 				self._serverpubkeylen = self._receive_int(SIZEOF_SHORT)
@@ -721,16 +723,16 @@ class Client:
 				self._verifytokenlen = self._receive_int(SIZEOF_SHORT)
 				self._verifytoken = self._receive(self._verifytokenlen)
 
-				# self._serverpubkey =  RSA.import_key(self._serverpubkey)
-				# print(self._serverid, self._serverpubkey, self._verifytoken, sep="\n\n")
+				self._serverpubkey_object =  RSA.import_key(self._serverpubkey)
 
-				# sharedsecret = os.urandom(16)
-				# cipher = PKCS1_v1_5.new(self._serverpubkey)
-				# cipheredsecret = cipher.encrypt(sharedsecret)
-				# cipheredverifytoken = cipher.encrypt(self._verifytoken)
-				# print(cipheredsecret)
-				# print(cipheredverifytoken)
-				# self._send_packet(PacketID.ENCRYPTIONKEYRESPONSE, len(cipheredsecret).to_bytes(SIZEOF_SHORT, 'big'), cipheredsecret, len(cipheredverifytoken).to_bytes(SIZEOF_SHORT, 'big'), cipheredverifytoken)
+				sharedsecret = os.urandom(16)
+				cipher = PKCS1_v1_5.new(self._serverpubkey_object)
+				cipheredsecret = cipher.encrypt(sharedsecret)
+				cipheredverifytoken = cipher.encrypt(self._verifytoken)
+				self._send_packet(PacketID.ENCRYPTIONKEYRESPONSE, len(cipheredsecret).to_bytes(SIZEOF_SHORT, 'big'), cipheredsecret, len(cipheredverifytoken).to_bytes(SIZEOF_SHORT, 'big'), cipheredverifytoken)
+
+				self._decrypt_cipher = AES.new(sharedsecret, AES.MODE_CFB, sharedsecret)
+				self._encrypt_cipher = AES.new(sharedsecret, AES.MODE_CFB, sharedsecret)
 
 				if not self._is_logged_in:
 					self._debuglog("Sending Client Statuses...")
@@ -928,8 +930,9 @@ class Client:
 		while True:
 			data = self._sock.recv(2048)
 			if not data:
-				return b''.join(data)
+				raise RuntimeError("Socket Connection Broken")
 			chunks.append(data)
+		return self._decipher(b''.join(data))
 
 	def __receive(self, amt, data):
 		if self._is_connected:
@@ -943,18 +946,19 @@ class Client:
 						raise RuntimeError("Socket Connection Broken")
 					chunks.append(chunk)
 					bytes_recd = bytes_recd + len(chunk)
-				return b''.join(chunks)
+				return self._decipher(b''.join(chunks))
 			else:
 				o = []
 				for i in range(amt):
 					o.append(data.pop(0))
-				return bytes(o)
+				return self._decipher(bytes(o))
 		else:
 			# self._errorlog("Socket Connection Broken")
 			raise RuntimeError("Socket Connection Broken")
+
 	def _send(self, *args):
 		data = b''.join([data for data in args])
-		if self._sock.sendall(data) == 0:
+		if self._sock.sendall(self._encipher(data)) == 0:
 			self._errorlog("Socket Connection Broken")
 			raise RuntimeError("socket connection broken")
 
@@ -1036,6 +1040,17 @@ class Client:
 			return n
 		except struct.error:
 			self._warning(f"[_encode_double] Failed to encode float {data}")
+
+	def _encipher(self, data):
+		if self._encrypt_cipher is not None:
+			return self._encrypt_cipher.encrypt(data)
+		return data
+
+	def _decipher(self, data):
+		if self._decrypt_cipher is not None:
+			return self._decrypt_cipher.decrypt(data)
+		return data
+
 
 if __name__=='__main__':
 	debug = False

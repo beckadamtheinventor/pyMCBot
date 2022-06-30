@@ -168,7 +168,10 @@ class World:
 		
 		# Read compressed data
 		data = buff.read(data_len)
-		data = zlib.decompress(data)
+		try:
+			data = zlib.decompress(data)
+		except:
+			return
 		# data = StringIO(data)
 		
 		for i in range(chunk_count):
