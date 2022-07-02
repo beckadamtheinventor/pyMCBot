@@ -11,12 +11,18 @@ def death_handler(client):
 if __name__=='__main__':
 	import sys
 	if len(sys.argv) > 2:
-		username = sys.argv[1]
-		host = sys.argv[2]
+		if sys.argv[1] == "-d":
+			debug = True
+			i = 2
+		else:
+			debug = False
+			i = 1
+		username = sys.argv[i]
+		host = sys.argv[i+1]
 
-		client = Client()
-		if len(sys.argv) > 3:
-			client.connect(host, port)
+		client = Client(debug)
+		if len(sys.argv) > i+2:
+			client.connect(host, sys.argv[i+2])
 		else:
 			client.connect(host)
 
@@ -27,4 +33,4 @@ if __name__=='__main__':
 			client.update()
 
 	else:
-		print("Usage: walkingBot username host [port]")
+		print("Usage: walkingBot [-d] username host [port]")
