@@ -1,0 +1,1 @@
+python ..\pymcbot\pyMCBot.py -d -u susbot -a localhost

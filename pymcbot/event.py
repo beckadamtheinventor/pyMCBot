@@ -83,5 +83,5 @@ class Event:
 	SERVERLISTPING   = 0xFE
 	DISCONNECT       = 0xFF
 
-	BOTATTACKED      = 0x102
+	BOTHURT          = 0x102
 	BOTDEAD          = 0x103

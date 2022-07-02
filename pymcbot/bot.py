@@ -1,12 +1,12 @@
 
-import os, sys, math, socket, threading, time, struct, hashlib, gzip, zlib, base64
+import os, sys, math, socket, threading, time, struct, hashlib, gzip, zlib, json
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
-from PacketID import PacketID
-from Event import Event
-from NBT import NBT
-from smpmap.smpmap import *
+from .packet import PacketID
+from .event import Event
+from .nbt import NBT
+from .smpmap.smpmap import *
 
 MC_DEFAULT_PORT = 25565
 PROTOCOL_VERSION = 78
@@ -66,7 +66,7 @@ class Client:
 		self._debug_mode = debug
 		self._packet_log_mode = False
 		self._packet_thread = None
-		self._is_connected = False
+		self.is_running = False
 		self._is_logged_in = False
 		self._is_waiting_to_spawn = False
 		self._outbound_encryption_enabled = False
@@ -79,6 +79,7 @@ class Client:
 		self.can_run = False
 		self._has_sent_respawn = False
 		self._entities = {}
+		self.username = None
 		self.worldage = None
 		self.timeofday = None
 		self._update = None
@@ -137,11 +138,12 @@ class Client:
 		""" Returns True if the player is standing on a solid block. TODO: Implement. """
 		return True
 
-	def login(self, user, passwd=None, run=True):
+	def login(self, username, passwd=None, run=True):
 		""" Log into a server and run the bot. (unless run=False)"""
+		self.username = username
 		self._infolog("Logging in...")
 		self._send_packet(PacketID.HANDSHAKE, bytes([PROTOCOL_VERSION]),
-			self._encode_string(user), self._encode_string(self.host), self.port.to_bytes(4, 'big'))
+			self._encode_string(username), self._encode_string(self.host), self.port.to_bytes(4, 'big'))
 		self._debuglog("Sent handshake.")
 		self._infolog("Waiting for login...")
 		self._is_waiting_to_spawn = True
@@ -159,15 +161,11 @@ class Client:
 			self._errorlog(str(e))
 
 	def _handle_packets(self):
-		while self._is_connected:
+		while self.is_running:
 			try:
-				if self._update is not None:
-					self._update()
 				self.update()
-				try:
-					self.handle_packet()
-				except TimeoutError:
-					pass
+			except TimeoutError:
+				pass
 			except KeyboardInterrupt:
 				break
 			except Exception as e:
@@ -175,15 +173,25 @@ class Client:
 				# self._debuglog(list(self._world.columns.keys()))
 				break
 
+	def message(self, message):
+		self.message_raw({"text": message})
+
+	def message_raw(self, messagejson):
+		self._send_packet(PacketID.CHATMESSAGE, bytes(json.dumps(messagejson)))
+
 	def set_event_handler(self, event, handler):
+		""" Set a function to be run when an event occurs """
 		self._event_handlers[event] = handler
 
-	def update(self):
+	def __update(self):
 		if 9 in self.metadata.keys():
 			self.health = self.metadata[9]["value"]
 
-		if self.health <= 0.0 and not self._has_sent_respawn:
-			self._fire_event(event=Event.BOTDEAD)
+		if self._entity_status == 2:
+			self._fire_event(Event.BOTHURT)
+
+		if (self._entity_status == 3 or self.health <= 0.0) and not self._has_sent_respawn:
+			self._fire_event(Event.BOTDEAD)
 			# tell the server we're ready to respawn
 			self._send_packet(PacketID.CLIENTSTATUSES, 1)
 			x, y, z = self.position["x"], self.position["y"], self.position["z"]
@@ -204,9 +212,10 @@ class Client:
 			return self.__oldpackets[i]
 		raise ValueError("Argument must be a valid integer or None")
 
-	def handle_packet(self):
+	def update(self):
 		""" Handle a packet if a packet is available """
-		if self._is_connected:
+		if self.is_running:
+			self.__update()
 			packetid = self._receive_int(SIZEOF_BYTE, signed=False)
 
 			if self._packet_log_mode:
@@ -251,6 +260,7 @@ Max players on server {self.server_max_players}")
 			elif packetid == PacketID.CHATMESSAGE:
 				message = self._receive_string()
 				self._messagelog(message)
+				self.last_message = message
 			elif packetid == PacketID.TIMEUPDATE:      # S->C when the world age/time updates
 				self.worldage = self._receive_int(SIZEOF_LONG)
 				self.timeofday = self._receive_int(SIZEOF_LONG)
@@ -285,7 +295,7 @@ Max players on server {self.server_max_players}")
 				self.gamemode = self._receive_int(SIZEOF_BYTE, signed=False)
 				self.worldheight = self._receive_int(SIZEOF_BYTE, signed=False)
 				# self.level_type = self._receive_string()
-				self._debuglog(f"Spawning in dim {self.dimension} level type \"{self.level_type}\" at",
+				self._debuglog(f"Spawning in dim {self.dimension} at",
 					f"{self.spawn_position['x']}, {self.spawn_position['y']}, {self.spawn_position['z']}",
 					f"with difficulty {self.difficulty}")
 				self.position = self.spawn_position
@@ -792,11 +802,11 @@ Max players on server {self.server_max_players}")
 				self._outbound_encryption_enabled = True
 				self._inbound_encryption_enabled = True
 
-			self._fire_event(event=packetid)
+			self._fire_event(packetid)
 
-	def _fire_event(self, *args, event=None, **kwargs):
+	def _fire_event(self, event):
 		if event in self._event_handlers.keys():
-			return self._event_handlers[event](args, kwargs)
+			return self._event_handlers[event](self)
 		return None
 
 	def _update_block(self, cx, cz, x, y, z, blockid, metadata):
@@ -818,7 +828,7 @@ Max players on server {self.server_max_players}")
 
 	def connect(self, addr=None, port=MC_DEFAULT_PORT):
 		if addr is None:
-			if self._is_connected:
+			if self.is_running:
 				self.logout()
 		else:
 			if ":" in addr:
@@ -833,7 +843,7 @@ Max players on server {self.server_max_players}")
 			self._connect(addr, port)
 
 	def disconnect(self):
-		if self._is_connected:
+		if self.is_running:
 			self.logout()
 
 	def message(self, message):
@@ -841,7 +851,7 @@ Max players on server {self.server_max_players}")
 
 	def _connect(self, addr, port=MC_DEFAULT_PORT):
 		self._sock.connect((addr, port))
-		self._is_connected = True
+		self.is_running = True
 
 	def _disconnect(self):
 		try:
@@ -850,7 +860,7 @@ Max players on server {self.server_max_players}")
 			pass
 
 		self._is_logged_in = False
-		self._is_connected = False
+		self.is_running = False
 
 		# wait for the packet handling thread to complete
 		time.sleep(0.25)
@@ -996,7 +1006,7 @@ Max players on server {self.server_max_players}")
 		return self._decipher(b''.join(data))
 
 	def __receive(self, amt, data):
-		if self._is_connected:
+		if self.is_running:
 			if data is None:
 				bytes_recd = 0
 				chunks = []
