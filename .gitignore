@@ -1,4 +1,5 @@
 __pycache__
 logs
+pymcbot/logs
 local
 tmp

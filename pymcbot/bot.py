@@ -3,10 +3,17 @@ import os, sys, math, socket, threading, time, struct, hashlib, gzip, zlib, json
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
-from packet import PacketID
-from event import Event
-from nbt import NBT
-from smpmap.smpmap import *
+if __name__ == '__main__':
+	from packet import PacketID
+	from event import Event
+	from nbt import NBT
+	from smpmap.smpmap import *
+else:
+	from .packet import PacketID
+	from .event import Event
+	from .nbt import NBT
+	from .smpmap.smpmap import *
+
 
 MC_DEFAULT_PORT = 25565
 PROTOCOL_VERSION = 78
@@ -196,7 +203,7 @@ class Client:
 			self._send_packet(PacketID.CLIENTSTATUSES, 1)
 			x, y, z = self.position["x"], self.position["y"], self.position["z"]
 			self._send_packet(PacketID.PLAYERPOS, self._encode_double(x), self._encode_double(y),
-				self._encode_double(z), (1 if self.is_on_ground() else 0))
+				self._encode_double(y+self.stance_offset), self._encode_double(z), (1 if self.is_on_ground() else 0))
 			# self._send_packet(PacketID.RESPAWN, 0, 0, 0)
 			self._has_sent_respawn = True
 
@@ -228,7 +235,7 @@ class Client:
 			if packetid == PacketID.KEEPALIVE:         # S<>C let the server know we're still listening
 				number = self._receive_int(SIZEOF_INT)
 				self._debuglog(f"Keepalive Received.")
-				self._send_packet(PacketID.KEEPALIVE, number.to_bytes(SIZEOF_INT, 'big', signed=True))
+				self._send_packet(PacketID.KEEPALIVE)
 			elif packetid == PacketID.LOGINREQUEST:    # S->C server response to handshake
 				self.eid = self._receive_int(SIZEOF_INT)
 				self._entities[self.eid] = {"equipment":self.equipment,"position":self.position,"rotation":self.rotation, "inventory":self.inventory}
@@ -1042,7 +1049,7 @@ Max players on server {self.server_max_players}")
 				o.append(arg)
 			elif type(arg) is str:
 				o.extend(self._str_to_bytes(arg))
-		self._debuglog("Sending packet:", bytes(o))
+		self._debuglog("Sending packet:", bytes(o).hex())
 		self._send(bytes(o))
 
 	def _encode_string(self, data):
