@@ -76,12 +76,17 @@ class ChunkData:
 	
 	def get(self, x, y, z):
 		self.fill()
-		return self.data[x + ((y * 16) + z) * 16]
+		if x in range(16) and y in range(16) and z in range(16):
+			return self.data[x + ((y * 16) + z) * 16]
+		else:
+			raise IndexError(f"Chunk subsection position {x},{y},{z} is out of bounds")
 	
 	def put(self, x, y, z, data):
 		self.fill()
-		print(len(self.data))
-		self.data[x + ((y * 16) + z) * 16] = data
+		if x in range(16) and y in range(16) and z in range(16):
+			self.data[x + ((y * 16) + z) * 16] = data
+		else:
+			raise IndexError(f"Chunk subsection position {x},{y},{z} is out of bounds")
 
 
 class ChunkDataNibble(ChunkData):
@@ -91,23 +96,29 @@ class ChunkDataNibble(ChunkData):
 	
 	def get(self, x, y, z):
 		self.fill()
-		x, r = divmod(x, 2)
 		i = x + ((y * 16) + z) * 16
-	   
-		if r == 0:
-			return self.data[i] // 2**4
-		else:
-			return self.data[i] & 0x0F
+		i, r = divmod(i, 2)
+		
+		try:
+			if r == 0:
+				return self.data[i] // 2**4
+			else:
+				return self.data[i] & 0x0F
+		except IndexError:
+			raise IndexError(f"Chunk subsection position {x*2},{y},{z} is out of bounds")
    
 	def put(self, x, y, z, data):
 		self.fill()
-		x, r = divmod(x, 2)
 		i = x + ((y * 16) + z) * 16
+		i, r = divmod(i, 2)
 		
-		if r == 0:
-			self.data[i] = (self.data[i] & 0x0F) | ((data & 0x0F) * 2**4)
-		else:
-			self.data[i] = (self.data[i] & 0xF0) | (data & 0x0F)
+		try:
+			if r == 0:
+				self.data[i] = (self.data[i] & 0x0F) | ((data & 0x0F) * 2**4)
+			else:
+				self.data[i] = (self.data[i] & 0xF0) | (data & 0x0F)
+		except IndexError:
+			raise IndexError(f"Chunk subsection position {x*2},{y},{z} is out of bounds")
 
 
 class Chunk(dict):

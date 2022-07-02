@@ -1,4 +1,5 @@
 
+# Unused
 
 class EntityMetadata:
 	BYTE         = 0x00

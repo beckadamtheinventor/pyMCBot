@@ -1,9 +1,10 @@
 
-import os, sys, math, socket, threading, time, struct, hashlib, zlib, base64
+import os, sys, math, socket, threading, time, struct, hashlib, gzip, zlib, base64
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
 from PacketID import PacketID
+from Event import Event
 from NBT import NBT
 from smpmap.smpmap import *
 
@@ -68,28 +69,37 @@ class Client:
 		self._is_connected = False
 		self._is_logged_in = False
 		self._is_waiting_to_spawn = False
-		self._encryption_enabled = False
+		self._outbound_encryption_enabled = False
+		self._inbound_encryption_enabled = False
 		self.in_godmode = False
 		self.can_fly = False
 		self.is_flying = False
 		self.in_creative_mode = False
 		self.can_move = False
 		self.can_run = False
+		self._has_sent_respawn = False
 		self._entities = {}
 		self.worldage = None
 		self.timeofday = None
 		self._update = None
+		self.eid = None
+		self.metadata = {}
+		self._entity_status = 0
 		self.last_packet_id = None
 		self.position = {"x": None, "y": None, "z": None}
 		self.stance_offset = 1.62
 		self.spawn_position = {"x": None, "y": None, "z": None}
 		self.rotation = {"pitch": None, "yaw": None}
-		self.health = None
+		self.gamemode = 0
+		self.difficulty = 0
+		self.dimension = 0
+		self.health = 20.0
 		self.food = None
 		self.saturation = None
 		self.equipment = {}
 		self.inventory = {}
 		self.tab_completed_string = None
+		self._event_handlers = {}
 		self.__packet = None
 		self.__oldpackets = []
 
@@ -123,12 +133,6 @@ class Client:
 		""" Set whether packet logging is active. """
 		self._packet_log_mode = debug
 
-	def is_handling_packets(self):
-		""" Returns True if the server's packet thread is alive. """
-		if self._packet_thread is not None:
-			return self._packet_thread.is_alive()
-		return False
-
 	def is_on_ground(self):
 		""" Returns True if the player is standing on a solid block. TODO: Implement. """
 		return True
@@ -141,47 +145,25 @@ class Client:
 		self._debuglog("Sent handshake.")
 		self._infolog("Waiting for login...")
 		self._is_waiting_to_spawn = True
+		self._debuglog("Sending Client brand")
+		self._send_packet(PacketID.PLUGINMESSAGE, self._encode_string("MC|Brand"), (7).to_bytes(2, 'big', signed=True), b'vanilla')
 		if run:
 			self.run()
 
 
 	def run(self):
-		""" Start the bot's packet handling thread. """
-		self._packet_thread = threading.Thread(target=self._handle_packets)
-		self._packet_thread.start()
-
-	def dummy(self):
-		""" Pause until the bot is disconnected or a keyboard interrupt is triggered. """
+		""" Start the bot's main loop. """
 		try:
-			while self._is_connected:
-				time.sleep(0.01)
-		except KeyboardInterrupt:
-			self._disconnect()
-
-	def console(self):
-		""" Run an interactive console until the bot is disconnected or a keyboard interrupt is triggered. """
-		try:
-			while self._is_connected:
-				cmd = input("> ")
-				if " " in cmd:
-					cmd, args = cmd.split()
-				else:
-					cmd, args = cmd, []
-				if cmd in ("help", "h"):
-					print("stop         (stop the bot)")
-					print("send packetid [f|d|i|s|b|\"|][value][\"] [...]")
-				elif cmd in ("stop",):
-					break
-		except KeyboardInterrupt:
-			pass
-		print("Shutting down...")
-		self._disconnect()
+			self._handle_packets()
+		except Exception as e:
+			self._errorlog(str(e))
 
 	def _handle_packets(self):
 		while self._is_connected:
 			try:
 				if self._update is not None:
 					self._update()
+				self.update()
 				try:
 					self.handle_packet()
 				except TimeoutError:
@@ -192,6 +174,27 @@ class Client:
 				self._errorlog(e)
 				# self._debuglog(list(self._world.columns.keys()))
 				break
+
+	def set_event_handler(self, event, handler):
+		self._event_handlers[event] = handler
+
+	def update(self):
+		if 9 in self.metadata.keys():
+			self.health = self.metadata[9]["value"]
+
+		if self.health <= 0.0 and not self._has_sent_respawn:
+			self._fire_event(event=Event.BOTDEAD)
+			# tell the server we're ready to respawn
+			self._send_packet(PacketID.CLIENTSTATUSES, 1)
+			x, y, z = self.position["x"], self.position["y"], self.position["z"]
+			self._send_packet(PacketID.PLAYERPOS, self._encode_double(x), self._encode_double(y),
+				self._encode_double(z), (1 if self.is_on_ground() else 0))
+			# self._send_packet(PacketID.RESPAWN, 0, 0, 0)
+			self._has_sent_respawn = True
+
+		if self.health > 0.0:
+			self._has_sent_respawn = False
+
 
 	def get_packet(self, i=None):
 		""" Return a previously processed packet or the current packet if no index is passed. Returns None if packet log mode is not enabled. """
@@ -214,24 +217,30 @@ class Client:
 			self._debuglog(f"Got packet: {hex(packetid)}")
 			self.last_packet_id = packetid
 			if packetid == PacketID.KEEPALIVE:         # S<>C let the server know we're still listening
-				number = self._receive(SIZEOF_INT)
+				number = self._receive_int(SIZEOF_INT)
 				self._debuglog(f"Keepalive Received.")
-				self._send_packet(PacketID.KEEPALIVE)
+				self._send_packet(PacketID.KEEPALIVE, number.to_bytes(SIZEOF_INT, 'big', signed=True))
 			elif packetid == PacketID.LOGINREQUEST:    # S->C server response to handshake
-				self._eid = self._receive_int(SIZEOF_INT)
-				self._entities[self._eid] = {"equipment":self.equipment,"position":self.position,"rotation":self.rotation, "inventory":self.inventory}
+				self.eid = self._receive_int(SIZEOF_INT)
+				self._entities[self.eid] = {"equipment":self.equipment,"position":self.position,"rotation":self.rotation, "inventory":self.inventory}
 				self.level_type = self._receive_string()
 				self.gamemode = self._receive_int(SIZEOF_BYTE)
 				self.dimension = self._receive_int(SIZEOF_BYTE)
 				self.difficulty = self._receive_int(SIZEOF_BYTE)
 				self._receive_int(SIZEOF_BYTE) # unused field
-				self._maxplayers = self._receive_int(SIZEOF_BYTE)
+				self.server_max_players = self._receive_int(SIZEOF_BYTE)
 				self._is_logged_in = True
-				self._infolog("Logged in.")
+				self._infolog(f"Logged in. Entity ID {self.eid} Gamemode {self.gamemode} Dimension {self.dimension} Difficulty {self.difficulty} \
+Max players on server {self.server_max_players}")
 				self._debuglog("Sending Client Settings...")
 				self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 0, 9, 0, 0)
 				self._debuglog("Sent.")
 				# self._encryption_enabled = True
+			elif packetid == PacketID.HANDSHAKE:
+				protocol_version = self._receive_int(SIZEOF_BYTE)
+				server_name = self._receive_string() # maybe?
+				server_host = self._receive_string()
+				server_port = self._receive_int(SIZEOF_INT)
 			elif packetid == PacketID.DISCONNECT:
 				reason = self._receive_string()
 				try:
@@ -247,34 +256,37 @@ class Client:
 				self.timeofday = self._receive_int(SIZEOF_LONG)
 			elif packetid == PacketID.ENTITYEQUIPMENT: # S->C when entity equipment changes
 				eid = self._receive_int(SIZEOF_ENTITYID)
+				slot = self._receive_int(SIZEOF_SHORT)
+				slotdata = self._receive_slot()
 				if eid not in self._entities.keys():
 					self._entities[eid] = \
 						{"equipment":{},"position":{"x":None, "y":None, "z":None},"rotation":{"pitch":None,"yaw":None},"status":0}
-				slot = self._receive_int(SIZEOF_SHORT)
 				if "equipment" not in self._entities.keys():
 					self._entities[eid]["equipment"] = {}
-				self._entities[eid]["equipment"][slot] = self._receive_slot()
+				self._entities[eid]["equipment"][slot] = slotdata
 			elif packetid == PacketID.SPAWNPOSITION:   # S->C when player spawnpoint changes / is set
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_INT)
 				z = self._receive_int(SIZEOF_INT)
 				self.spawn_position = {"x": x, "y": y, "z": z}
+			elif packetid == PacketID.USEENTITY:
+				user = self._receive_int(SIZEOF_INT)
+				target = self._receive_int(SIZEOF_INT)
+				mousebutton = self._receive_int(SIZEOF_BYTE)
 			elif packetid == PacketID.UPDATEHEALTH:    # S->C when player health/hunger/saturation changes
 				self.health = self._receive_float()
 				self.food = self._receive_int(SIZEOF_SHORT)
 				self.saturation = self._receive_float()
 				self.can_run = self.food > 6.0
-				if self.health <= 0.0:
-					self._send_packet(PacketID.CLIENTSTATUSES, 0x01) # tell the server we're ready to respawn
 			elif packetid == PacketID.RESPAWN:         # S->C when player respawns
 				self._debuglog("Received respawn packet")
 				self.dimension = self._receive_int(SIZEOF_INT)
 				self.difficulty = self._receive_int(SIZEOF_BYTE, signed=False)
 				self.gamemode = self._receive_int(SIZEOF_BYTE, signed=False)
 				self.worldheight = self._receive_int(SIZEOF_BYTE, signed=False)
-				self.level_type = self._receive_string()
-				self._debuglog(f"Spawning in {self.dimension} level type {self.level_type} at",
-					f"({self.spawn_position['x']}, {self.spawn_position['y']}, {self.spawn_position['z']})",
+				# self.level_type = self._receive_string()
+				self._debuglog(f"Spawning in dim {self.dimension} level type \"{self.level_type}\" at",
+					f"{self.spawn_position['x']}, {self.spawn_position['y']}, {self.spawn_position['z']}",
 					f"with difficulty {self.difficulty}")
 				self.position = self.spawn_position
 				self._send_packet(PacketID.PLAYER, 1 if self.is_on_ground() else 0)
@@ -290,12 +302,12 @@ class Client:
 				self.rotation["yaw"] = self._receive_float()
 				self.rotation["pitch"] = self._receive_float()
 				self._on_ground = self._receive_int() > 0
-				if self._is_waiting_to_spawn:
-					self._send_packet(PacketID.PLAYERPOSANDLOOK, self._encode_double(self.position['x']),
-						self._encode_double(self.position['y']), self._encode_double(self.position['y']+self.stance_offset),
-						self._encode_double(self.position['z']), self._encode_float(self.rotation['yaw']),
-						self._encode_float(self.rotation['pitch']), 1 if self.is_on_ground() else 0)
-					self._is_waiting_to_spawn = False
+				# if self._is_waiting_to_spawn:
+					# self._send_packet(PacketID.PLAYERPOSANDLOOK, self._encode_double(self.position['x']),
+						# self._encode_double(self.position['y']), self._encode_double(self.position['y']+self.stance_offset),
+						# self._encode_double(self.position['z']), self._encode_float(self.rotation['yaw']),
+						# self._encode_float(self.rotation['pitch']), 1 if self.is_on_ground() else 0)
+					# self._is_waiting_to_spawn = False
 			elif packetid == PacketID.HELDITEMCHANGE:   # S<>C when held item slot changes
 				self._hotbar_selection = self._receive_int(SIZEOF_SHORT)
 			elif packetid == PacketID.USEBED:           # S->C when an entity goes to sleep
@@ -326,19 +338,21 @@ class Client:
 				self._entities[eid]["rotation"] = {"pitch": pitch, "yaw": yaw}
 				self._entities[eid]["helditem"] = helditem
 				self._entities[eid]["metadata"] = metadata
+				self._debuglog(f"Server spawned player {eid} named {name} at {x}, {y}, {z}")
 			elif packetid == PacketID.COLLECTITEM:      # S->C trigger item collection animation
 				itemeid = self._receive_int(SIZEOF_INT)
 				eid = self._receive_int(SIZEOF_INT)
+				self._debuglog(f"Entity {eid} picked up item entity {itemeid}")
 			elif packetid == PacketID.SPAWNOBJECT:  # S-C Spawn an object/vehicle
 				eid = self._receive_int(SIZEOF_INT)
 				_type = self._receive_int(SIZEOF_BYTE)
-				self._debuglog(f"Spawning entity type {_type} with ID {eid}")
 				x = self._receive_fixed(SIZEOF_INT)
 				y = self._receive_fixed(SIZEOF_INT)
 				z = self._receive_fixed(SIZEOF_INT)
 				yaw = self._receive_int(SIZEOF_BYTE, signed=False)/(math.pi/128)
 				pitch = self._receive_int(SIZEOF_BYTE, signed=False)/(math.pi/128)
 				objectdata = self._receive_objectdata()
+				self._debuglog(f"Server spawned object/vehicle {eid} type {_type} at {x}, {y}, {z}")
 			elif packetid == PacketID.SPAWNMOB:     # S->C Spawn a mob
 				eid = self._receive_int(SIZEOF_INT)
 				_type = self._receive_int(SIZEOF_BYTE)
@@ -351,11 +365,11 @@ class Client:
 				vx = self._receive_int(SIZEOF_SHORT)
 				vy = self._receive_int(SIZEOF_SHORT)
 				vz = self._receive_int(SIZEOF_SHORT)
-				self._debuglog(f"Spawning mob {eid} of type {_type} at {x}, {y}, {z}")
 				metadata = self._receive_metadata()
 				self._entities[eid] = {"type":_type, "position":{"x": x, "y": y, "z": z},
 					"rotation":{"pitch":pitch, "yaw":yaw}, "headpitch": headpitch,
 					"velocity":{"x": vx, "y": vy, "z": vz}, "metadata": metadata, "status": 0}
+				self._debuglog(f"Server spawned mob {eid} type {_type} at {x}, {y}, {z}")
 			elif packetid == PacketID.SPAWNPAINTING: # S->C Spawn a painting
 				eid = self._receive_int(SIZEOF_INT)
 				title = self._receive_string()
@@ -365,12 +379,14 @@ class Client:
 				direction = self._receive_int(SIZEOF_INT)
 				self._entities[eid] = {"type": "painting", "position": {"x": x, "y": y, "z": z},
 					"direction": direction, "title": title}
+				self._debuglog(f"Server spawned painting {eid} titled {title} at {x}, {y}, {z} facing {direction}")
 			elif packetid == PacketID.SPAWNEXPORB:  # S->C Spawn an experience orb
 				eid = self._receive_int(SIZEOF_INT)
 				x = self._receive_fixed(SIZEOF_INT)
 				y = self._receive_fixed(SIZEOF_INT)
 				z = self._receive_fixed(SIZEOF_INT)
 				count = self._receive_int(SIZEOF_SHORT)
+				self._debuglog(f"Server spawned xp orb {eid} at {x}, {y}, {z} of value {count}")
 				self._entities[eid] = {"type": "experience", "position": {"x": x, "y": y, "z": z},
 					"count": count}
 			elif packetid == PacketID.ENTITYVELOCITY: # S->C Set an entity's velocity
@@ -380,17 +396,20 @@ class Client:
 				vz = self._receive_int(SIZEOF_SHORT)
 				if eid in self._entities.keys(): # sanity-check if we know this entity exists yet
 					self._entities[eid]["velocity"] = {"x": vx, "y": vy, "z": vz}
+				self._debuglog(f"Server set entity velocity to {vx}, {vy}, {vz}")
 			elif packetid == PacketID.DESTROYENTITY: # S->C Destroy an entity
 				count = self._receive_int(SIZEOF_BYTE)
 				for i in range(count):
 					eid = self._receive_int(SIZEOF_INT)
 					if eid in self._entities.keys():
 						del self._entities[eid]
+				self._debuglog(f"Server destroyed entity {eid}")
 			elif packetid == PacketID.ENTITY:        # S->C Initialize an entity if it hasn't been initialized yet
 				eid = self._receive_int(SIZEOF_INT)
 				if eid not in self._entities.keys():
 					self._entities[eid] = \
 						{"equipment":{},"position":{"x":None, "y":None, "z":None},"rotation":{"pitch":None,"yaw":None}}
+				self._debuglog(f"Server initialized entity {eid}")
 			elif packetid == PacketID.ENTITYRELMOVE: # S->C Sent when an entity travels less than 4 blocks
 				eid = self._receive_int(SIZEOF_INT)
 				dx = self._receive_fixed(SIZEOF_BYTE, fractionalbits=6)
@@ -401,12 +420,14 @@ class Client:
 					pos["x"] += dx
 					pos["y"] += dy
 					pos["z"] += dz
+				self._debuglog(f"Server moved {eid} by {dx}, {dy}, {dz}")
 			elif packetid == PacketID.ENTITYLOOK:   #S->C Sent when an entity rotates
 				eid = self._receive_int(SIZEOF_INT)
 				yaw = self._receive_int(SIZEOF_BYTE, signed=False)/(math.pi/128)
 				pitch = self._receive_int(SIZEOF_BYTE, signed=False)/(math.pi/128)
 				if eid in self._entities.keys():
 					self._entities[eid]["rotation"] = {"pitch":pitch, "yaw":yaw}
+				self._debuglog(f"Server rotated {eid} to yaw {yaw} pitch {pitch}")
 			elif packetid == PacketID.ENTITYLOOKANDRELMOVE:   #S->C Sent when an entity moves less than 4 blocks and rotates
 				eid = self._receive_int(SIZEOF_INT)
 				dx = self._receive_fixed(SIZEOF_BYTE, fractionalbits=6)
@@ -420,6 +441,7 @@ class Client:
 					pos["x"] += dx
 					pos["y"] += dy
 					pos["z"] += dz
+				self._debuglog(f"Server moved {eid} by {dx}, {dy}, {dz} and rotated to yaw {yaw} pitch {pitch}")
 			elif packetid == PacketID.ENTITYTELEPORT:        # S->C Sent when an entity moves more than 4 blocks
 				eid = self._receive_int(SIZEOF_INT)
 				x = self._receive_fixed(SIZEOF_INT)
@@ -427,6 +449,7 @@ class Client:
 				z = self._receive_fixed(SIZEOF_INT)
 				yaw = self._receive_int(SIZEOF_BYTE, signed=False)/(math.pi/128)
 				pitch = self._receive_int(SIZEOF_BYTE, signed=False)/(math.pi/128)
+				self._debuglog(f"Server teleported {eid} to {x}, {y}, {z} and rotated to yaw {yaw} pitch {pitch}")
 				if eid in self._entities.keys():
 					self._entities[eid]["rotation"] = {"pitch":pitch, "yaw":yaw}
 					self._entities[eid]["position"] = {"x": x, "y": y, "z": z}
@@ -438,7 +461,7 @@ class Client:
 			elif packetid == PacketID.ENTITYSTATUS:         # S->C Set the status of an entity
 				eid = self._receive_int(SIZEOF_INT)
 				status = self._receive_int(SIZEOF_BYTE)
-				if eid == self._eid:
+				if eid == self.eid:
 					self._entity_status = status
 				elif eid in self._entities.keys():
 					self._entities[eid]["status"] = status
@@ -451,9 +474,11 @@ class Client:
 					if leash:
 						self._entities[eid]["leashedto"] = vid
 			elif packetid == PacketID.ENTITYMETADATA:
-				self._debuglog("Receiving Entity Metadata packet")
 				eid = self._receive_int(SIZEOF_INT)
+				self._debuglog(f"Received Entity Metadata packet for {eid}")
 				metadata = self._receive_metadata()
+				if eid == self.eid:
+					self.metadata = metadata
 				if eid in self._entities.keys():
 					self._entities[eid]["metadata"] = metadata
 			elif packetid == PacketID.ENTITYEFFECT:        # S->C Add an effect to an entity
@@ -461,6 +486,7 @@ class Client:
 				effect = self._receive_int(SIZEOF_INT)
 				amplifier = self._receive_int(SIZEOF_BYTE)
 				duration = self._receive_int(SIZEOF_SHORT)
+				self._debuglog(f"Received Entity Effect packet for {eid} with effect {effect} amplifier {amplifier} duration {duration}")
 				if eid in self._entities.keys():
 					if "effects" not in self._entities[eid].keys():
 						self._entities[eid]["effects"] = []
@@ -468,6 +494,7 @@ class Client:
 			elif packetid == PacketID.REMOVEENTITYEFFECT:  # S->C Remove an effect ID on an entity.
 				eid = self._receive_int(SIZEOF_INT)
 				effect = self._receive_int(SIZEOF_INT)
+				self._debuglog(f"Received Entity Effect Remove packet for {eid} removing effect {effect}")
 				if eid in self._entities.keys():
 					if "effects" in self._entities[eid].keys():
 						i = 0
@@ -718,7 +745,12 @@ class Client:
 			elif packetid == PacketID.PLUGINMESSAGE:
 				channel = self._receive_string()
 				datalen = self._receive_int(SIZEOF_SHORT)
-				data = self._receive(datalen)
+				if datalen > 0:
+					data = self._receive(datalen)
+				else:
+					data = ""
+				if channel == "MC|Brand":
+					self.server_brand = data
 				self._infolog("Plugin Message Received:", channel, data)
 			elif packetid == PacketID.ENCRYPTIONKEYREQUEST: # S->C Server sends serverid, pubkey, and verifytoken
 				self._serverid = self._receive_string()
@@ -733,47 +765,52 @@ class Client:
 				cipher = PKCS1_v1_5.new(self._serverpubkey_object)
 				cipheredsecret = cipher.encrypt(sharedsecret)
 				cipheredverifytoken = cipher.encrypt(self._verifytoken)
-				self._send_packet(PacketID.ENCRYPTIONKEYRESPONSE, len(cipheredsecret).to_bytes(SIZEOF_SHORT, 'big'), cipheredsecret, len(cipheredverifytoken).to_bytes(SIZEOF_SHORT, 'big'), cipheredverifytoken)
 
 				self._decrypt_cipher = AES.new(sharedsecret, AES.MODE_CFB, sharedsecret)
 				self._encrypt_cipher = AES.new(sharedsecret, AES.MODE_CFB, sharedsecret)
 
-				self._encryption_enabled = True
+				self._send_packet(PacketID.ENCRYPTIONKEYRESPONSE, len(cipheredsecret).to_bytes(SIZEOF_SHORT, 'big'), cipheredsecret, len(cipheredverifytoken).to_bytes(SIZEOF_SHORT, 'big'), cipheredverifytoken)
+
 
 				self._debuglog("Sending Client Statuses...")
 				self._send_packet(PacketID.CLIENTSTATUSES, 0x00) # tell the server we're ready to spawn
 				self._debuglog("Sent.")
 
-				self._debuglog("Sending Client Settings...")
-				self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 3, 9, 3, 1)
-				self._debuglog("Sent.")
-
-				self._encryption_enabled = False
+				# self._debuglog("Sending Client Settings...")
+				# self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 3, 9, 3, 1)
+				# self._debuglog("Sent.")
 
 			elif packetid == PacketID.ENCRYPTIONKEYRESPONSE:
-				sharedsecretlen = self._receive_int(SIZEOF_SHORT)
-				if sharedsecretlen > 0:
-					sharedsecret = self._receive(sharedsecretlen)
-					self._debuglog("Got shared secret:", sharedsecret)
-				verifytokenlen = self._receive_int(SIZEOF_SHORT)
-				if verifytokenlen > 0:
-					verifytoken = self._receive(verifytokenlen)
-					self._debuglog("Got verify token:", verifytoken)
+				string1len = self._receive_int(SIZEOF_SHORT)
+				if string1len > 0:
+					string1 = self._receive(string1len)
+					self._debuglog("Got shared secret:", string1)
+				string2len = self._receive_int(SIZEOF_SHORT)
+				if string2len > 0:
+					string2 = self._receive(string2len)
+					self._debuglog("Got verify token:", string2)
+				self._outbound_encryption_enabled = True
+				self._inbound_encryption_enabled = True
 
-				self._encryption_enabled = True
+			self._fire_event(event=packetid)
+
+	def _fire_event(self, *args, event=None, **kwargs):
+		if event in self._event_handlers.keys():
+			return self._event_handlers[event](args, kwargs)
+		return None
 
 	def _update_block(self, cx, cz, x, y, z, blockid, metadata):
-		if x in range(16) and y in range(16):
+		if x in range(16) and z in range(16):
 			self._debuglog(f"[_update_block] updating block {x}, {y}, {z} in chunk {cx}, {cz} to {blockid}:{metadata}")
 			key = (cx, cz)
-			if key not in self._world.columns:
-				self._world.columns = ChunkColumn()
+			if key not in self._world.columns.keys():
+				self._world.columns[key] = ChunkColumn()
 			column = self._world.columns[key]
 			if column is None:
 				column = self._world.columns[key] = ChunkColumn()
 			chunk = column.chunks[y//16]
 			if chunk is None:
-				chunk = Chunk()
+				chunk = column.chunks[y//16] = Chunk()
 			chunk['block_data'].put(x, y & 0xF, z, blockid)
 			chunk['block_meta'].put(x, y & 0xF, z, metadata)
 		else:
@@ -816,10 +853,13 @@ class Client:
 		self._is_connected = False
 
 		# wait for the packet handling thread to complete
-		while self.is_handling_packets():
-			time.sleep(0.05)
+		time.sleep(0.25)
 
-		self._sock.close()
+		try:
+			self._sock.shutdown()
+			self._sock.close()
+		except:
+			pass
 
 	def _errorlog(self, *args):
 		self.__logwrite("[E]", " ".join([str(arg) for arg in args]))
@@ -853,38 +893,32 @@ class Client:
 			if item == 0x7F:
 				return metadata
 			key, _type = item & 0x1F, item // 2**5
-			self._debuglog(f"Reading entity metadata type: {_type} with key {key}")
 			if _type in ENTITY_METADATA_VALUE_TYPE_READERS.keys():
 				reader = ENTITY_METADATA_VALUE_TYPE_READERS[_type]
 				value = reader(self, data)
 				metadata[key] = {"value": value, "type": _type}
+				self._debuglog(f"Read entity metadata type: {_type} with key {key} value {value}")
 			else:
 				# self._errorlog(f"Received invalid entity metadata key {key} type {_type}")
 				raise ValueError(f"Invalid entity metadata received: key {key} type {_type} ({hex(item)})")
 
 	def _receive_slot(self, data=None):
-		c = self._receive_int(SIZEOF_SHORT, data=data)
+		itemid = self._receive_int(SIZEOF_SHORT, data=data)
 		self._debuglog("receiving slot...")
-		self._debuglog(f"slot number: {c}")
-		if c > 0:
-			itemid = self._receive_int(SIZEOF_SHORT, data=data)
-			self._debuglog(f"Item ID: {hex(itemid)}")
-			if itemid != -1:
-				itemcount = self._receive_int(SIZEOF_BYTE, data=data)
-				itemdamage = self._receive_int(SIZEOF_SHORT, data=data)
-				if itemcount > 0:
-					nbtsize = self._receive_int(SIZEOF_SHORT, data=data)
-					self._debuglog(f"count: {itemcount} damage: {itemdamage} nbt bytes: {nbtsize}")
-					if nbtsize == -1:
-						nbtsize = 0
-					if nbtsize > 0:
-						nbt = NBT(self._receive(nbtsize, data=data))
-					else:
-						nbt = None
-					return {"id": itemid, "count": itemcount, "nbt": nbt}
-			return {"id": -1, "count": -1, "nbt": None}
+		self._debuglog(f"item id: {itemid}")
+		if itemid >= 0:
+			itemcount = self._receive_int(SIZEOF_BYTE, data=data)
+			itemdamage = self._receive_int(SIZEOF_SHORT, data=data)
+			nbtsize = self._receive_int(SIZEOF_SHORT, data=data)
+			self._debuglog(f"count: {itemcount} damage: {itemdamage} nbt bytes: {nbtsize}")
+			if nbtsize <= 0:
+				return {"id": itemid, "count": itemcount, "nbt": None}
+			data = gzip.decompress(self._receive(nbtsize, data=data))
+			self._debuglog("Decompressed NBT data:", data.hex())
+			nbt = NBT(data)
+			return {"id": itemid, "count": itemcount, "nbt": nbt}
 		else:
-			return None
+			return {"id": -1, "count": -1, "nbt": None}
 
 	def _receive_int(self, amt=1, signed=True, data=None):
 		return int.from_bytes(self._receive(amt, data=data), 'big', signed=signed)
@@ -937,7 +971,7 @@ class Client:
 	def _receive_objectdata(self, data=None):
 		intfield = self._receive_int(SIZEOF_INT, data=data)
 		if intfield == 0:
-			return {"intfield": intfeild}
+			return {"intfield": intfield}
 		x = self._receive_int(SIZEOF_SHORT, data=data)
 		y = self._receive_int(SIZEOF_SHORT, data=data)
 		z = self._receive_int(SIZEOF_SHORT, data=data)
@@ -985,7 +1019,7 @@ class Client:
 
 	def _send(self, *args):
 		data = b''.join([data for data in args])
-		if self._sock.sendall(self._encipher(data)) == 0:
+		if self._sock.sendall(self._encipher(data)) is not None:
 			self._errorlog("Socket Connection Broken")
 			raise RuntimeError("socket connection broken")
 
@@ -1069,12 +1103,12 @@ class Client:
 			self._warning(f"[_encode_double] Failed to encode float {data}")
 
 	def _encipher(self, data):
-		if self._encryption_enabled:
+		if self._outbound_encryption_enabled:
 			return self._encrypt_cipher.encrypt(data)
 		return data
 
 	def _decipher(self, data):
-		if self._encryption_enabled:
+		if self._inbound_encryption_enabled:
 			return self._decrypt_cipher.decrypt(data)
 		return data
 
@@ -1112,7 +1146,8 @@ if __name__=='__main__':
 """)
 	else:
 		client = Client(debug=debug)
+		# Connect to the server
 		client.connect(address, port)
+		# Log in and run the bot
 		client.login(username, passwd)
-		client.dummy()
 

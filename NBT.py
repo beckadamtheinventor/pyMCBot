@@ -13,6 +13,14 @@ TAG_Compound    = 0x0A
 TAG_Int_Array   = 0x0B
 TAG_Long_Array  = 0x0C
 
+# 0a0003746167090004656e63680a000000010200036c766c0001020002696400300000
+# TAG_Compound tag
+#   TAG_List ench, TAG_Compund
+#       TAG_Short lvl: 0x01
+#       TAG_Short id: 0x30
+#     TAG_End
+# TAG_End
+
 class NBT:
 	def __init__(self, data=None):
 		if type(data) is bytes or type(data) is tuple:
@@ -34,11 +42,9 @@ class NBT:
 
 	def _decode(self, data=None):
 		self._finished_reading = False
-		_data = {}
-		self.__decode_value(data, _data)
-		return _data
+		return self.__decode(data)
 
-	def __decode(self, data=None):
+	def __decode(self, data):
 		_data = {}
 		while self.__decode_value(data, _data):
 			if self._finished_reading:
@@ -49,50 +55,55 @@ class NBT:
 		c = self._read_byte(data)
 		if c == TAG_End or self._finished_reading:
 			return False
+		key, value = self.__decode_value_type(data, c)
+		_data[key] = value
+		return True
+
+	def __decode_value_type(self, data, c):
 		key = self._read_key(data)
 		if c == TAG_Byte:
-			_data[key] = self._read_byte(data)
+			return key, self._read_byte(data)
 		elif c == TAG_Short:
-			_data[key] = int.from_bytes(self._read_byte(data, 2), 'big', signed=True)
+			return key, int.from_bytes(self._read_byte(data, 2), 'big', signed=True)
 		elif c == TAG_Int:
-			_data[key] = int.from_bytes(self._read_byte(data, 4), 'big', signed=True)
+			return key, int.from_bytes(self._read_byte(data, 4), 'big', signed=True)
 		elif c == TAG_Long:
-			_data[key] = int.from_bytes(self._read_byte(data, 8), 'big', signed=True)
+			return key, int.from_bytes(self._read_byte(data, 8), 'big', signed=True)
 		elif c == TAG_Float:
-			_data[key] = float.fromhex(hex(bytes(self._read_byte(data, 4))))
+			return key, float.fromhex(hex(bytes(self._read_byte(data, 4))))
 		elif c == TAG_Double:
-			_data[key] = float.fromhex(hex(bytes(self._read_byte(data, 8))))
+			return key, float.fromhex(hex(bytes(self._read_byte(data, 8))))
 		elif c == TAG_Byte_Array:
 			amt = int.from_bytes(self._read_byte(data, 4), 'big', signed=True)
-			_data[key] = bytearray(self._read_byte(data, amt))
+			return key, bytearray(self._read_byte(data, amt))
 		elif c == TAG_Int_Array:
 			amt = int.from_bytes(self._read_byte(data, 4), 'big', signed=True)
 			o = []
 			for i in range(amt):
 				o.append(int.from_bytes(self._read_byte(data, 4), 'big', signed=True))
-			_data[key] = o
+			return key, o
 		elif c == TAG_Long_Array:
 			amt = int.from_bytes(self._read_byte(data, 4), 'big', signed=True)
 			o = []
 			for i in range(amt):
 				o.append(int.from_bytes(self._read_byte(data, 8), 'big', signed=True))
-			_data[key] = o
+			return key, o
 		elif c == TAG_List:
+			dt = self._read_byte(data)
 			amt = int.from_bytes(self._read_byte(data, 4), 'big', signed=True)
 			o = []
 			for i in range(amt):
-				o.append(self.__decode(self, data))
-			_data[key] = o
+				o.append(self.__decode_value_type(data, dt))
+			return key, o
 		elif c == TAG_String:
-			amt = int.from_bytes(self._read_byte(data, 2), 'big', signed=False)
+			amt = int.from_bytes(self._read_byte(data, 2), 'big', signed=True)
 			o = []
 			for i in range(amt):
 				o.append(self._read_byte(data))
 		elif c == TAG_Compound:
-			_data[key] = self.__decode(self, data)
+			return key, self.__decode(data)
 		else:
 			raise ValueError(f"Invalid NBT entry type byte: {hex(c)}")
-		return True
 
 	def _read_key(self, data):
 		if self._finished_reading:
