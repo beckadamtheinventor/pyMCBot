@@ -3,10 +3,10 @@ import os, sys, math, socket, threading, time, struct, hashlib, gzip, zlib, json
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
-from .packet import PacketID
-from .event import Event
-from .nbt import NBT
-from .smpmap.smpmap import *
+from packet import PacketID
+from event import Event
+from nbt import NBT
+from smpmap.smpmap import *
 
 MC_DEFAULT_PORT = 25565
 PROTOCOL_VERSION = 78
