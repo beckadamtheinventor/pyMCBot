@@ -1,4 +1,5 @@
 
+import math
 from pymcbot.bot import Client
 from pymcbot.event import Event
 
@@ -29,8 +30,11 @@ if __name__=='__main__':
 		client.set_event_handler(Event.BOTHURT, attack_handler)
 		client.set_event_handler(Event.BOTDEAD, death_handler)
 		client.login(username, run=False)
+		angle = 0
 		while client.is_running:
 			client.update()
+			client.walk(angle)
+			angle += math.pi/8
 
 	else:
-		print("Usage: walkingBot [-d] username host [port]")
+		print("Usage: [-d] username host [port]")

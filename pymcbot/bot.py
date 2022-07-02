@@ -98,6 +98,10 @@ class Client:
 		self.stance_offset = 1.62
 		self.spawn_position = {"x": None, "y": None, "z": None}
 		self.rotation = {"pitch": None, "yaw": None}
+		self._flyingspeed = 0
+		self._walkingspeed = 0
+		self._walkingtime = 0
+		self._walk_velocity = (0, 0)
 		self.gamemode = 0
 		self.difficulty = 0
 		self.dimension = 0
@@ -186,6 +190,23 @@ class Client:
 	def message_raw(self, messagejson):
 		self._send_packet(PacketID.CHATMESSAGE, bytes(json.dumps(messagejson)))
 
+	def walk(self, direction, amount=1):
+		dx, dz = math.cos(direction)*self._walkingspeed, math.sin(direction)*self._walkingspeed
+		self._walk_velocity = (dx, dz)
+		self._walkingtime = amount - 1
+	
+	def _walk(self):
+		dx, dz = self._walk_velocity
+		self.position['x'] += dx
+		self.position['z'] += dz
+		self._send_position_packet()
+
+
+	def _send_position_packet(self):
+		x, y, z = self.position["x"], self.position["y"], self.position["z"]
+		self._send_packet(PacketID.PLAYERPOS, self._encode_double(x), self._encode_double(y),
+			self._encode_double(y+self.stance_offset), self._encode_double(z), (1 if self.is_on_ground() else 0))
+
 	def set_event_handler(self, event, handler):
 		""" Set a function to be run when an event occurs """
 		self._event_handlers[event] = handler
@@ -201,15 +222,17 @@ class Client:
 			self._fire_event(Event.BOTDEAD)
 			# tell the server we're ready to respawn
 			self._send_packet(PacketID.CLIENTSTATUSES, 1)
-			x, y, z = self.position["x"], self.position["y"], self.position["z"]
-			self._send_packet(PacketID.PLAYERPOS, self._encode_double(x), self._encode_double(y),
-				self._encode_double(y+self.stance_offset), self._encode_double(z), (1 if self.is_on_ground() else 0))
+			self.position = self.spawn_position.copy()
+			self._send_position_packet()
 			# self._send_packet(PacketID.RESPAWN, 0, 0, 0)
 			self._has_sent_respawn = True
 
 		if self.health > 0.0:
 			self._has_sent_respawn = False
 
+		if self._walkingtime > 0:
+			self._walk()
+			self._walkingtime -= 1
 
 	def get_packet(self, i=None):
 		""" Return a previously processed packet or the current packet if no index is passed. Returns None if packet log mode is not enabled. """
@@ -230,7 +253,6 @@ class Client:
 					self.__oldpackets.append(bytes(self.__packet))
 				self.__packet = [packetid]
 
-			self._debuglog(f"Got packet: {hex(packetid)}")
 			self.last_packet_id = packetid
 			if packetid == PacketID.KEEPALIVE:         # S<>C let the server know we're still listening
 				number = self._receive_int(SIZEOF_INT)
@@ -250,13 +272,14 @@ class Client:
 Max players on server {self.server_max_players}")
 				self._debuglog("Sending Client Settings...")
 				self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 0, 9, 0, 0)
-				self._debuglog("Sent.")
+				# self._debuglog("Sent.")
 				# self._encryption_enabled = True
 			elif packetid == PacketID.HANDSHAKE:
 				protocol_version = self._receive_int(SIZEOF_BYTE)
 				server_name = self._receive_string() # maybe?
 				server_host = self._receive_string()
 				server_port = self._receive_int(SIZEOF_INT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.DISCONNECT:
 				reason = self._receive_string()
 				try:
@@ -271,6 +294,7 @@ Max players on server {self.server_max_players}")
 			elif packetid == PacketID.TIMEUPDATE:      # S->C when the world age/time updates
 				self.worldage = self._receive_int(SIZEOF_LONG)
 				self.timeofday = self._receive_int(SIZEOF_LONG)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.ENTITYEQUIPMENT: # S->C when entity equipment changes
 				eid = self._receive_int(SIZEOF_ENTITYID)
 				slot = self._receive_int(SIZEOF_SHORT)
@@ -281,20 +305,24 @@ Max players on server {self.server_max_players}")
 				if "equipment" not in self._entities.keys():
 					self._entities[eid]["equipment"] = {}
 				self._entities[eid]["equipment"][slot] = slotdata
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.SPAWNPOSITION:   # S->C when player spawnpoint changes / is set
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_INT)
 				z = self._receive_int(SIZEOF_INT)
 				self.spawn_position = {"x": x, "y": y, "z": z}
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.USEENTITY:
 				user = self._receive_int(SIZEOF_INT)
 				target = self._receive_int(SIZEOF_INT)
 				mousebutton = self._receive_int(SIZEOF_BYTE)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.UPDATEHEALTH:    # S->C when player health/hunger/saturation changes
 				self.health = self._receive_float()
 				self.food = self._receive_int(SIZEOF_SHORT)
 				self.saturation = self._receive_float()
 				self.can_run = self.food > 6.0
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.RESPAWN:         # S->C when player respawns
 				self._debuglog("Received respawn packet")
 				self.dimension = self._receive_int(SIZEOF_INT)
@@ -305,7 +333,7 @@ Max players on server {self.server_max_players}")
 				self._debuglog(f"Spawning in dim {self.dimension} at",
 					f"{self.spawn_position['x']}, {self.spawn_position['y']}, {self.spawn_position['z']}",
 					f"with difficulty {self.difficulty}")
-				self.position = self.spawn_position
+				self.position = self.spawn_position.copy()
 				self._send_packet(PacketID.PLAYER, 1 if self.is_on_ground() else 0)
 				self._send_packet(PacketID.PLAYERPOS, self._encode_double(self.position['x']),
 					self._encode_double(self.position['y']), self._encode_double(self.position['y']+self.stance_offset),
@@ -325,19 +353,23 @@ Max players on server {self.server_max_players}")
 						# self._encode_double(self.position['z']), self._encode_float(self.rotation['yaw']),
 						# self._encode_float(self.rotation['pitch']), 1 if self.is_on_ground() else 0)
 					# self._is_waiting_to_spawn = False
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.HELDITEMCHANGE:   # S<>C when held item slot changes
 				self._hotbar_selection = self._receive_int(SIZEOF_SHORT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.USEBED:           # S->C when an entity goes to sleep
 				eid = self._receive_int(SIZEOF_INT)
 				self._receive_int(SIZEOF_BYTE, signed=False) # probably unused field
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_BYTE, signed=False)
 				z = self._receive_int(SIZEOF_INT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.ANIMATION:         # S->C when an animation happens
 				eid = self._receive_int(SIZEOF_INT)
 				if eid not in self._entities.keys():
 					self._entities[eid] = {}
 				self._entities[eid]["animation"] = self._receive_int(SIZEOF_BYTE, signed=False)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.SPAWNNAMEDENTITY:  # S->C when a named entity spawns
 				eid = self._receive_int(SIZEOF_INT)
 				name = self._receive_string()
@@ -475,6 +507,7 @@ Max players on server {self.server_max_players}")
 				yaw = self._receive_int(SIZEOF_BYTE, signed=False)/(math.pi/128)
 				if eid in self._entities.keys():
 					self._entities[eid]["headyaw"] = yaw
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.ENTITYSTATUS:         # S->C Set the status of an entity
 				eid = self._receive_int(SIZEOF_INT)
 				status = self._receive_int(SIZEOF_BYTE)
@@ -482,6 +515,7 @@ Max players on server {self.server_max_players}")
 					self._entity_status = status
 				elif eid in self._entities.keys():
 					self._entities[eid]["status"] = status
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.ATTACHENTITY:         # S->C Attach an entity to another entity
 				eid = self._receive_int(SIZEOF_INT)
 				vid = self._receive_int(SIZEOF_INT)
@@ -490,6 +524,7 @@ Max players on server {self.server_max_players}")
 					self._entities[eid]["attachedto"] = vid
 					if leash:
 						self._entities[eid]["leashedto"] = vid
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.ENTITYMETADATA:
 				eid = self._receive_int(SIZEOF_INT)
 				self._debuglog(f"Received Entity Metadata packet for {eid}")
@@ -524,6 +559,7 @@ Max players on server {self.server_max_players}")
 				self._experiencebar = self._receive_float()
 				self._experiencelevel = self._receive_int(SIZEOF_SHORT)
 				self._totalexperience = self._receive_int(SIZEOF_SHORT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.ENTITYPROPERTIES:    # S->C Set an entity's properties. TODO: Actually make this do stuff
 				eid = self._receive_int(SIZEOF_INT)
 				numproperties = self._receive_int(SIZEOF_INT)
@@ -577,6 +613,7 @@ Max players on server {self.server_max_players}")
 				z = self._receive_int(SIZEOF_INT)
 				blocktype = self._receive_int(SIZEOF_SHORT)
 				metadata = self._receive_int(SIZEOF_BYTE)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 				self._update_block(x//16, z//16, x&15, y, z&15, blocktype&0xFF, metadata)
 			elif packetid == PacketID.BLOCKACTION:
 				x = self._receive_int(SIZEOF_INT)
@@ -584,12 +621,14 @@ Max players on server {self.server_max_players}")
 				z = self._receive_int(SIZEOF_INT)
 				b1 = self._receive_int(SIZEOF_BYTE)
 				b2 = self._receive_int(SIZEOF_BYTE)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.BLOCKBREAKANIMATION:
 				eid = self._receive_int(SIZEOF_INT)
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_SHORT)
 				z = self._receive_int(SIZEOF_INT)
 				destroystage = self._receive_int(SIZEOF_BYTE)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.MAPCHUNKBULK:     # S->C When sending several chunks
 				chunkcount = self._receive(SIZEOF_SHORT)
 				datalen = self._receive(SIZEOF_INT)
@@ -614,6 +653,7 @@ Max players on server {self.server_max_players}")
 				playermotionx = self._receive_float()
 				playermotiony = self._receive_float()
 				playermotionz = self._receive_float()
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.SOUNDORPARTICLEEFFECT:
 				effectid = self._receive_int(SIZEOF_INT)
 				x = self._receive_int(SIZEOF_INT)
@@ -621,6 +661,7 @@ Max players on server {self.server_max_players}")
 				z = self._receive_int(SIZEOF_INT)
 				data = self._receive_int(SIZEOF_INT)
 				disablerelativevolume = self._receive_int(SIZEOF_BYTE)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.NAMEDSOUNDEFFECT:
 				soundname = self._receive_string()
 				x = self._receive_int(SIZEOF_INT)
@@ -628,6 +669,7 @@ Max players on server {self.server_max_players}")
 				z = self._receive_int(SIZEOF_INT)
 				volume = self._receive_float()
 				pitch = self._receive_int(SIZEOF_BYTE) # 63 = 100%
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.PARTICLE:
 				particlename = self._receive_string()
 				x = self._receive_float()
@@ -638,14 +680,19 @@ Max players on server {self.server_max_players}")
 				oz = self._receive_float()
 				speed = self._receive_float()
 				number = self._receive_int(SIZEOF_INT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.CHANGEGAMESTATE:
 				reason = self._receive_int(SIZEOF_BYTE)
 				gamemode = self._receive_int(SIZEOF_BYTE)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 				if reason == 1:
+					self._debuglog("It is now raining")
 					self._is_raining = True
 				elif reason == 2:
+					self._debuglog("It is no longer raining")
 					self._is_raining = False
 				elif reason == 3:
+					self._debuglog("Gamemode has been updated to", gamemode)
 					self.gamemode = gamemode
 			elif packetid == PacketID.SPAWNGLOBALENTITY:
 				entityid = self._receive_int(SIZEOF_INT)
@@ -653,6 +700,7 @@ Max players on server {self.server_max_players}")
 				x = self._receive_fixed(SIZEOF_INT)
 				y = self._receive_fixed(SIZEOF_INT)
 				z = self._receive_fixed(SIZEOF_INT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.OPENWINDOW:
 				windowid = self._receive_int(SIZEOF_BYTE, signed=False)
 				windowtype = self._receive_int(SIZEOF_BYTE, signed=False)
@@ -668,27 +716,33 @@ Max players on server {self.server_max_players}")
 					entityid = self._receive_int(SIZEOF_INT)
 			elif packetid == PacketID.CLOSEWINDOW:
 				windowid = self._receive_int(SIZEOF_BYTE, signed=False)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.SETSLOT:
 				windowid = self._receive_int(SIZEOF_BYTE, signed=False)
 				slot = self._receive_int(SIZEOF_SHORT)
 				slotdata = self._receive_slot()
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.SETWINDOWITEMS:
 				windowid = self._receive_int(SIZEOF_BYTE, signed=False)
 				count = self._receive_int(SIZEOF_SHORT)
 				slots = []
 				for i in range(count):
 					slots.append(self._receive_slot())
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.UPDATEWINDOWPROPERTY:
 				windowid = self._receive_int(SIZEOF_BYTE, signed=False)
 				prop = self._receive_int(SIZEOF_SHORT)
 				value = self._receive_int(SIZEOF_SHORT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.CONFIRMTRANSACTION:
 				windowid = self._receive_int(SIZEOF_BYTE, signed=False)
 				actionnumber = self._receive_int(SIZEOF_SHORT)
 				accepted = self._receive_int(SIZEOF_BYTE)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.CREATIVEINVENTORYACTION:
 				slot = self._receive_int(SIZEOF_SHORT)
 				item = self._receive_slot()
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.UPDATESIGN:
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_SHORT)
@@ -697,11 +751,13 @@ Max players on server {self.server_max_players}")
 				line2 = self._receive_string()
 				line3 = self._receive_string()
 				line4 = self._receive_string()
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.ITEMDATA:
 				itemtype = self._receive_int(SIZEOF_SHORT)
 				itemid = self._receive_int(SIZEOF_SHORT)
 				datalen = self._receive_int(SIZEOF_SHORT)
 				data = self._receive(datalen)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.UPDATETILEENTITY:
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_SHORT)
@@ -710,18 +766,22 @@ Max players on server {self.server_max_players}")
 				datalen = self._receive_int(SIZEOF_SHORT)
 				if datalen > 0:
 					data = self._receive(datalen)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.TILEEDITOROPEN:
 				tileentityid = self._receive_int(SIZEOF_BYTE)
 				x = self._receive_int(SIZEOF_INT)
 				y = self._receive_int(SIZEOF_INT)
 				z = self._receive_int(SIZEOF_INT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.INCREMENTSTATISTIC:
 				statid = self._receive_int(SIZEOF_INT)
 				amount = self._receive_int(SIZEOF_INT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.PLAYERLISTITEM:
 				name = self._receive_string()
 				online = self._receive_int(SIZEOF_BYTE)
 				ping = self._receive_int(SIZEOF_SHORT)
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.PLAYERABILITIES:
 				flags = self._receive_int(SIZEOF_BYTE)
 				self.in_godmode = (flags & 8) != 0
@@ -730,21 +790,26 @@ Max players on server {self.server_max_players}")
 				self.in_creative_mode = (flags & 1) != 0
 				self._flyingspeed = self._receive_float()
 				self._walkingspeed = self._receive_float()
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.TABCOMPLETE:
 				self.tab_completed_string = self._receive_string()
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.SCOREBOARDOBJECTIVE:
 				objectivename = self._receive_string()
 				objectivevalue = self._receive_string()
 				createremove = self._receive_int(SIZEOF_BYTE) # 0 to create, 1 to remove, 2 to update display text
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.UPDATESCORE:
 				itemname = self._receive_string()
 				updateremove = self._receive_int(SIZEOF_BYTE) # 0 to create/update, 1 to remove
 				if updateremove != 1:
 					scorename = self._receive_string()
 					value = self._receive_int()
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.DISPLAYSCOREBOARD:
 				position = self._receive_int(SIZEOF_BYTE) # 0 = list, 1 = sidebar, 2 = belowName
 				scorename = self._receive_string()
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.TEAMS:
 				teamname = self._receive_string()
 				# 0->create team, 1->remove team, 2->update information, 3->add players, 4->remove players
@@ -759,6 +824,7 @@ Max players on server {self.server_max_players}")
 					players = []
 					for i in range(playercount):
 						players.append(self._receive_string())
+				self._debuglog(f"Got Packet: {hex(packetid)}")
 			elif packetid == PacketID.PLUGINMESSAGE:
 				channel = self._receive_string()
 				datalen = self._receive_int(SIZEOF_SHORT)
@@ -791,7 +857,7 @@ Max players on server {self.server_max_players}")
 
 				self._debuglog("Sending Client Statuses...")
 				self._send_packet(PacketID.CLIENTSTATUSES, 0x00) # tell the server we're ready to spawn
-				self._debuglog("Sent.")
+				# self._debuglog("Sent.")
 
 				# self._debuglog("Sending Client Settings...")
 				# self._send_packet(PacketID.CLIENTSETTINGS, self._encode_string(self._locale), 3, 9, 3, 1)
@@ -808,17 +874,20 @@ Max players on server {self.server_max_players}")
 					self._debuglog("Got verify token:", string2)
 				self._outbound_encryption_enabled = True
 				self._inbound_encryption_enabled = True
+			else:
+				self._debuglog(f"Got Unknown Packet: {hex(packetid)}")
 
 			self._fire_event(packetid)
 
 	def _fire_event(self, event):
 		if event in self._event_handlers.keys():
+			self._debuglog("Firing Event Handler for Event", event)
 			return self._event_handlers[event](self)
 		return None
 
 	def _update_block(self, cx, cz, x, y, z, blockid, metadata):
 		if x in range(16) and z in range(16):
-			self._debuglog(f"[_update_block] updating block {x}, {y}, {z} in chunk {cx}, {cz} to {blockid}:{metadata}")
+			# self._debuglog(f"[_update_block] updating block {x}, {y}, {z} in chunk {cx}, {cz} to {blockid}:{metadata}")
 			key = (cx, cz)
 			if key not in self._world.columns.keys():
 				self._world.columns[key] = ChunkColumn()
@@ -931,8 +1000,9 @@ Max players on server {self.server_max_players}")
 			if nbtsize <= 0:
 				return {"id": itemid, "count": itemcount, "nbt": None}
 			data = gzip.decompress(self._receive(nbtsize, data=data))
-			self._debuglog("Decompressed NBT data:", data.hex())
+			# self._debuglog("Decompressed NBT data:", data.hex())
 			nbt = NBT(data)
+			self._debuglog("NBT:", nbt)
 			return {"id": itemid, "count": itemcount, "nbt": nbt}
 		else:
 			return {"id": -1, "count": -1, "nbt": None}
@@ -1086,25 +1156,25 @@ Max players on server {self.server_max_players}")
 		return "".join(o)
 
 	def _decode_float(self, data):
-		self._debuglog(f"Unpacking float from 0x{''.join([hex(c//16)[2]+hex(c%16)[2] for c in data])} (big-endian)")
+		# self._debuglog(f"Unpacking float from 0x{''.join([hex(c//16)[2]+hex(c%16)[2] for c in data])} (big-endian)")
 		try:
 			n = struct.unpack('>f', data)[0]
-			self._debuglog(f"Unpacked float {n}")
+			# self._debuglog(f"Unpacked float {n}")
 			return n
 		except struct.error:
 			self._warning(f"[_decode_float] Failed to unpack float from data: 0x{''.join([hex(c//16)[2]+hex(c%16)[2] for c in data])} (big-endian)")
 
 	def _decode_double(self, data):
-		self._debuglog(f"[_decode_double] Unpacking double from 0x{''.join([hex(c//16)[2]+hex(c%16)[2] for c in data])} (big-endian)")
+		# self._debuglog(f"[_decode_double] Unpacking double from 0x{''.join([hex(c//16)[2]+hex(c%16)[2] for c in data])} (big-endian)")
 		try:
 			n = struct.unpack('>d', data)[0]
-			self._debuglog(f"[_decode_double] Unpacked double {n}")
+			# self._debuglog(f"[_decode_double] Unpacked double {n}")
 			return n
 		except struct.error:
 			self._warning(f"[_decode_double] Failed to unpack double from data: 0x{''.join([hex(c//16)[2]+hex(c%16)[2] for c in data])} (big-endian)")
 
 	def _encode_float(self, data):
-		self._debuglog(f"[_encode_float] Packing float {data}")
+		# self._debuglog(f"[_encode_float] Packing float {data}")
 		try:
 			n = struct.pack('>f', data)
 			return n
@@ -1112,12 +1182,12 @@ Max players on server {self.server_max_players}")
 			self._warning(f"[_encode_float] Failed to encode float {data}")
 
 	def _encode_double(self, data):
-		self._debuglog(f"[_encode_double] Packing float {data}")
+		# self._debuglog(f"[_encode_double] Packing double {data}")
 		try:
 			n = struct.pack('>f', data)
 			return n
 		except struct.error:
-			self._warning(f"[_encode_double] Failed to encode float {data}")
+			self._warning(f"[_encode_double] Failed to encode double {data}")
 
 	def _encipher(self, data):
 		if self._outbound_encryption_enabled:
