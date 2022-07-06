@@ -1,1 +1,1 @@
-python ..\pymcbot\pyMCBot.py -d -u susbot -a localhost
+python ..\examplebot.py -d susbot localhost

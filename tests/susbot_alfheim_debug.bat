@@ -1,1 +1,1 @@
-python ..\pymcbot\pyMCBot.py -d -u susbot -a alfheim.pw
+python ..\examplebot.py -d susbot alfheim.pw
