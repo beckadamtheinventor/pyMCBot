@@ -115,14 +115,14 @@ class Client:
         self.metadata = {}
         self._entity_status = 0
         self.last_packet_id = None
-        self.position = {"x": 0, "y": 0, "z": 0}
-        self.velocity = {"x": 0, "y": 0, "z": 0}
+        self.position = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self.velocity = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.stance_offset = 1.62
-        self.spawn_position = {"x": 0, "y": 0, "z": 0}
-        self.rotation = {"pitch": 0, "yaw": 0}
-        self._flyingspeed = 0
-        self._walkingspeed = 0
-        self._walkingtime = 0
+        self.spawn_position = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self.rotation = {"pitch": 0.0, "yaw": 0.0}
+        self.flying_speed = 0.02
+        self.walking_speed = 0.1
+        self.walking_time = 0
         self._walk_velocity = (0, 0)
         self.bounding_box = ((-0.5, 0, -0.5), (0.5, self.stance_offset, 0.5))
         self.gamemode = 0
@@ -249,11 +249,11 @@ class Client:
 
     def walk(self, direction, amount=1):
         if self.is_logged_in:
-            dx, dz = math.cos(direction) * self._walkingspeed, math.sin(direction) * self._walkingspeed
+            dx, dz = math.cos(direction) * self.walking_speed, math.sin(direction) * self.walking_speed
             if self.is_in_water():
                 pass
             self._walk_velocity = (dx, dz)
-            self._walkingtime = amount
+            self.walking_time = amount
 
     def _move_flying(self, par1, par2, par3):
         var4 = par1 ** 2 + par2 ** 2
@@ -278,6 +278,10 @@ class Client:
         return False
 
     def _push_out_of_blocks(self, x, y, z):
+        x, y, z = self.position['x'], self.position['y'], self.position['z']
+        block = self._world.get(int(x), int(y+1), int(z), "block_data")
+        if block > 0:
+            self.velocity['y'] = 0.5
         x2 = math.floor(x)
         y2 = math.floor(y)
         z2 = math.floor(z)
@@ -296,18 +300,19 @@ class Client:
     def _update_movement(self):
         if self.is_on_ground():
             self.velocity['y'] = 0
-            self.position['y'] = math.floor(self.position['y'])
+            self.position['y'] = math.ceil(self.position['y'])
         else:
-            self.velocity['y'] -= 1
+            self.velocity['y'] -= self.walking_speed*2
+        self._debuglog(f"moving by {self.velocity['x']}, {self.velocity['y']}, {self.velocity['z']}")
         self.position['x'] += self.velocity['x']
         self.position['y'] += self.velocity['y']
         self.position['z'] += self.velocity['z']
         self._send_position_packet()
-        self._schedule(self._update_movement, 0.5)
+        self.schedule(self._update_movement, 0.05)
 
     def _send_position_packet(self):
         if not self.is_waiting_to_spawn:
-            x, y, z = self.position["x"], self.position["y"], self.position["z"]
+            x, y, z = self.position['x'], self.position['y'], self.position['z']
             yaw, pitch = self.rotation["yaw"], self.rotation["pitch"]
             self._debuglog(f"Sending position {x}, {y}, {z} yaw {yaw} pitch {pitch}")
             self._queue_send_packet(PacketID.PLAYER_POSITION_AND_LOOK, self._encode_double(x), self._encode_double(y),
@@ -323,7 +328,7 @@ class Client:
         if self.health <= 0.0:
             self._entity_status = 0
             self._send_packet(PacketID.CLIENT_STATUS, 1)
-            self._schedule(self.__respawn, 1)
+            self.schedule(self.__respawn, 1)
         else:
             self.position = self.spawn_position.copy()
             self._fire_event(Event.BOT_RESPAWN)
@@ -336,15 +341,15 @@ class Client:
                     self._fire_event(Event.BOT_DEAD)
                     self._send_packet(PacketID.CLIENT_STATUS, 1)
                     self._has_sent_respawn = True
-                    self._schedule(self.__respawn, 3)
+                    self.schedule(self.__respawn, 3)
                 self._entity_status = 0
 
             if self.health > 0.0:
                 self._has_sent_respawn = False
 
-            if self._walkingtime > 0:
+            if self.walking_time > 0:
                 self._walk()
-                self._walkingtime -= 1
+                self.walking_time -= 1
 
             i = 0
             while i < len(self.__event_queue):
@@ -404,7 +409,7 @@ class Client:
                 self._debuglog("Sending Client Settings...")
                 self._send_packet(PacketID.CLIENT_SETTINGS, self._encode_string(self._locale), 0, 9, 3, 1)
                 self.is_waiting_to_spawn = False
-                self._schedule(self._update_movement, 2)
+                self.schedule(self._update_movement, 2)
             elif packet_id == PacketID.HANDSHAKE:
                 protocol_version = self._receive_int(SIZEOF_BYTE)
                 server_name = self._receive_string()  # maybe?
@@ -502,8 +507,8 @@ class Client:
                 x = self._receive_fixed(SIZEOF_INT)
                 y = self._receive_fixed(SIZEOF_INT)
                 z = self._receive_fixed(SIZEOF_INT)
-                yaw = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
-                pitch = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
+                yaw = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
+                pitch = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
                 helditem = self._receive_int(SIZEOF_SHORT, signed=False)
                 metadata = self._receive_metadata()
                 if eid not in self._entities.keys():
@@ -524,8 +529,8 @@ class Client:
                 x = self._receive_fixed(SIZEOF_INT)
                 y = self._receive_fixed(SIZEOF_INT)
                 z = self._receive_fixed(SIZEOF_INT)
-                yaw = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
-                pitch = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
+                yaw = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
+                pitch = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
                 objectdata = self._receive_objectdata()
                 self._debuglog(f"Server spawned object/vehicle {eid} type {_type} at {x}, {y}, {z}")
             elif packet_id == PacketID.SPAWN_MOB:  # S->C Spawn a mob
@@ -534,9 +539,9 @@ class Client:
                 x = self._receive_fixed(SIZEOF_INT)
                 y = self._receive_fixed(SIZEOF_INT)
                 z = self._receive_fixed(SIZEOF_INT)
-                pitch = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
-                headpitch = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
-                yaw = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
+                pitch = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
+                headpitch = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
+                yaw = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
                 vx = self._receive_int(SIZEOF_SHORT)
                 vy = self._receive_int(SIZEOF_SHORT)
                 vz = self._receive_int(SIZEOF_SHORT)
@@ -599,8 +604,8 @@ class Client:
                 self._debuglog(f"Server moved {eid} by {dx}, {dy}, {dz}")
             elif packet_id == PacketID.ENTITY_LOOK:  # S->C Sent when an entity rotates
                 eid = self._receive_int(SIZEOF_INT)
-                yaw = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
-                pitch = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
+                yaw = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
+                pitch = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
                 if eid in self._entities.keys():
                     self._entities[eid]["rotation"] = {"pitch": pitch, "yaw": yaw}
                 self._debuglog(f"Server rotated {eid} to yaw {yaw} pitch {pitch}")
@@ -609,8 +614,8 @@ class Client:
                 dx = self._receive_fixed(SIZEOF_BYTE, fractionalbits=6)
                 dy = self._receive_fixed(SIZEOF_BYTE, fractionalbits=6)
                 dz = self._receive_fixed(SIZEOF_BYTE, fractionalbits=6)
-                yaw = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
-                pitch = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
+                yaw = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
+                pitch = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
                 if eid in self._entities.keys():
                     self._entities[eid]["rotation"] = {"pitch": pitch, "yaw": yaw}
                     pos = self._entities[eid]["position"]
@@ -623,15 +628,15 @@ class Client:
                 x = self._receive_fixed(SIZEOF_INT)
                 y = self._receive_fixed(SIZEOF_INT)
                 z = self._receive_fixed(SIZEOF_INT)
-                yaw = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
-                pitch = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
+                yaw = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
+                pitch = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
                 self._debuglog(f"Server teleported {eid} to {x}, {y}, {z} and rotated to yaw {yaw} pitch {pitch}")
                 if eid in self._entities.keys():
                     self._entities[eid]["rotation"] = {"pitch": pitch, "yaw": yaw}
                     self._entities[eid]["position"] = {"x": x, "y": y, "z": z}
             elif packet_id == PacketID.ENTITY_HEAD_LOOK:  # S->C Sent to change the direction an entity's head is facing
                 eid = self._receive_int(SIZEOF_INT)
-                yaw = self._receive_int(SIZEOF_BYTE, signed=False) / (math.pi / 128)
+                yaw = self._receive_int(SIZEOF_BYTE, signed=False) * (math.pi / 128)
                 if eid in self._entities.keys():
                     self._entities[eid]["headyaw"] = yaw
                 self._debuglog(f"Got Packet: {hex(packet_id)}")
@@ -919,9 +924,11 @@ class Client:
                 self.can_fly = (flags & 4) != 0
                 self.is_flying = (flags & 2) != 0
                 self.in_creative_mode = (flags & 1) != 0
-                self._flyingspeed = self._receive_float()
-                self._walkingspeed = self._receive_float()
-                self._debuglog(f"Got Packet: {hex(packet_id)}")
+                self.flying_speed = self._receive_float()
+                self.walking_speed = self._receive_float()
+                self._debuglog(f"Got Player Abilities: walking speed: {self.walking_speed} flying speed: {self.flying_speed}"
+                               f"can fly: {self.can_fly} is flying {self.is_flying}"
+                               f"is in creative mode: {self.in_creative_mode} god mode: {self.in_godmode}")
             elif packet_id == PacketID.TAB_COMPLETE:
                 self.tab_completed_string = self._receive_string()
                 self._debuglog(f"Got Packet: {hex(packet_id)}")
@@ -1016,10 +1023,10 @@ class Client:
             return self._event_handlers[event](self)
         return None
 
-    def _schedule(self, function, dt):
+    def schedule(self, function, dt):
         self.__event_queue.append((Event.GENERAL_EVENT, time.time() + dt, function))
 
-    def _schedule_event(self, event, dt):
+    def schedule_event(self, event, dt):
         self.__event_queue.append((event, time.time() + dt, None))
 
     def _update_block(self, cx, cz, x, y, z, blockid, metadata):
@@ -1058,9 +1065,6 @@ class Client:
         if self.is_logged_in:
             self._disconnect()
 
-    def message(self, message):
-        pass
-
     def _connect(self, addr, port=MC_DEFAULT_PORT):
         self._sock.connect((addr, port))
         self.is_running = True
@@ -1070,8 +1074,7 @@ class Client:
             self._queue_send_packet(PacketID.DISCONNECT, 0, 0)
         except OSError:
             pass
-        except TimeoutError:
-            pass
+
 
         self.is_logged_in = False
         self.is_running = False
